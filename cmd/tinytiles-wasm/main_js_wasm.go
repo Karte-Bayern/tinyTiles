@@ -42,6 +42,7 @@ func main() {
 	bind("status", jsStatus)
 	bind("sync", jsSync)
 	bind("get", jsGet)
+	bind("routeTileKeys", jsRouteTileKeys)
 	api.Set("version", version)
 	js.Global().Set("tinyTiles", api)
 	println("tinyTiles WASM offline cache initialized")
@@ -128,6 +129,39 @@ func jsSync(_ js.Value, args []js.Value) any {
 			return
 		}
 		resolve.Invoke(jsJSON(result))
+	})
+}
+
+// routeTileKeys(route, options) resolves to {keys, truncated}: the corridor
+// of TMS tiles a route crosses at options.zoom, widened by options.radius
+// neighboring tiles. A PWA client calls this before sync so it downloads only
+// the corridor instead of computing (and likely over-fetching, via a
+// bounding rectangle) the request in JavaScript itself. It performs no I/O,
+// so it resolves immediately; it stays Promise-based for API consistency with
+// every other fallible call here.
+func jsRouteTileKeys(_ js.Value, args []js.Value) any {
+	if len(args) < 2 {
+		return rejectedPromise(fmt.Errorf("tinyTiles.routeTileKeys requires route and options"))
+	}
+	var route []offline.RoutePoint
+	if err := decodeJS(args[0], &route); err != nil {
+		return rejectedPromise(fmt.Errorf("decode route: %w", err))
+	}
+	var options offline.RouteSyncOptions
+	if err := decodeJS(args[1], &options); err != nil {
+		return rejectedPromise(fmt.Errorf("decode route options: %w", err))
+	}
+	return promise(func(resolve, reject js.Value) {
+		// RouteSyncRequest, not RouteTileKeys directly, so a zero MaxTiles gets
+		// the same DefaultRouteSyncMaxTiles fill-in a native Go caller gets
+		// instead of the unhelpful zero-tile result RouteTileKeys(..., 0) alone
+		// would produce.
+		request, truncated, err := offline.RouteSyncRequest(route, options)
+		if err != nil {
+			reject.Invoke(jsError(err))
+			return
+		}
+		resolve.Invoke(jsJSON(map[string]any{"keys": request.Keys, "truncated": truncated}))
 	})
 }
 

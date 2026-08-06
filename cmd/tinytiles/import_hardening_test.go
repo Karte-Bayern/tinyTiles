@@ -48,7 +48,7 @@ func TestCommandImportRejectsSourceArtifactOverlap(t *testing.T) {
 		t.Helper()
 		var stdout, stderr bytes.Buffer
 		code := run([]string{"import", "--replace", "--min-free=0", input, artifact}, &stdout, &stderr)
-		if code != 2 || !strings.Contains(stderr.String(), "must not refer to MBTiles source") {
+		if code != 2 || !strings.Contains(stderr.String(), "must not refer to import source") {
 			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 		}
 		info, err := os.Stat(source)
@@ -88,7 +88,7 @@ func TestCommandImportRejectsSourceArtifactOverlap(t *testing.T) {
 		}
 		var stdout, stderr bytes.Buffer
 		code := run([]string{"import", "--replace", "--min-free=0", containedSource, containedSourceDir}, &stdout, &stderr)
-		if code != 2 || !strings.Contains(stderr.String(), "must not contain MBTiles source") {
+		if code != 2 || !strings.Contains(stderr.String(), "must not contain import source") {
 			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 		}
 		if info, err := os.Stat(containedSource); err != nil || !info.Mode().IsRegular() {

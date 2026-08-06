@@ -114,7 +114,7 @@ func TestHandlerServesXYZAndRevisionedTMS(t *testing.T) {
 	if got := xyzResponse.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:8081" {
 		t.Fatalf("CORS origin = %q", got)
 	}
-	if data, checksum, found := server.tileCache.get(tiles.Key{Z: 2, X: 1, Y: 2}); !found || string(data) != string([]byte{1, 2, 3}) || checksum != offline.Checksum([]byte{1, 2, 3}) {
+	if data, checksum, found := server.gen.Load().tileCache.get(tiles.Key{Z: 2, X: 1, Y: 2}); !found || string(data) != string([]byte{1, 2, 3}) || checksum != offline.Checksum([]byte{1, 2, 3}) {
 		t.Fatalf("XYZ tile was not cached: bytes=%q checksum=%q found=%t", data, checksum, found)
 	}
 
@@ -225,7 +225,7 @@ func TestConfigurationAndPathValidation(t *testing.T) {
 	}
 	dataset := testDataset(t)
 	disabled, err := New(Config{Dataset: dataset, DatasetID: "fixture", TileCacheBytes: -1})
-	if err != nil || disabled.tileCache != nil {
+	if err != nil || disabled.gen.Load().tileCache != nil {
 		t.Fatalf("disabled tile cache server=%#v err=%v", disabled, err)
 	}
 	if _, err := New(Config{Dataset: dataset, DatasetID: "fixture", TileCacheBytes: -2}); err == nil {

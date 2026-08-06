@@ -80,14 +80,18 @@ func (s *Synchronizer) Sync(ctx context.Context, request SyncRequest) (SyncResul
 	if err := request.validate(); err != nil {
 		return SyncResult{}, err
 	}
-	manifest, err := s.Fetcher.FetchManifest(ctx)
+	manifest, manifestFromCache, err := s.resolveManifest(ctx, request)
 	if err != nil {
 		return SyncResult{}, fmt.Errorf("fetch sync manifest: %w", err)
 	}
-	// HTTPFetcher validates the decoded manifest before it returns. Keeping the
-	// generic Fetcher boundary defensive avoids an extra URL parse/allocation
-	// per warm HTTP sync without widening the trusted surface.
-	if !fetcherResponsesVerified {
+	// HTTPFetcher validates the decoded manifest before it returns, and a
+	// manifest reused from the local cache was already validated the sync
+	// that stored it (the only writer of Store.PutManifest is this
+	// Synchronizer's own publish, below). Keeping the generic Fetcher
+	// boundary defensive for a freshly fetched, non-HTTPFetcher manifest
+	// avoids an extra URL parse/allocation per warm HTTP sync without
+	// widening the trusted surface.
+	if !manifestFromCache && !fetcherResponsesVerified {
 		if err := manifest.Validate(); err != nil {
 			return SyncResult{}, fmt.Errorf("validate sync manifest: %w", err)
 		}
@@ -227,6 +231,34 @@ func (s *Synchronizer) Sync(ctx context.Context, request SyncRequest) (SyncResul
 		return SyncResult{}, err
 	}
 	return s.publish(ctx, request, manifest, previous, hadPrevious, total, state.downloadedCount(), state.reusedCount())
+}
+
+// resolveManifest fetches the sync manifest, using a conditional
+// revalidation against the locally cached copy when request names a dataset,
+// a cached manifest for it already exists, and s.Fetcher implements
+// ConditionalManifestFetcher. fromCache reports whether the returned
+// Manifest is that reused local copy — the source confirmed nothing changed
+// — rather than a freshly fetched body. Every other Fetcher/Store
+// combination falls through to the same unconditional FetchManifest call
+// this made before conditional support existed.
+func (s *Synchronizer) resolveManifest(ctx context.Context, request SyncRequest) (manifest Manifest, fromCache bool, err error) {
+	if request.Dataset != "" {
+		if conditional, ok := s.Fetcher.(ConditionalManifestFetcher); ok {
+			previous, hadPrevious, storeErr := s.Store.GetManifest(ctx, request.Dataset)
+			if storeErr == nil && hadPrevious {
+				fetched, unchanged, fetchErr := conditional.FetchManifestIfChanged(ctx, previous.Revision)
+				if fetchErr != nil {
+					return Manifest{}, false, fetchErr
+				}
+				if unchanged {
+					return previous, true, nil
+				}
+				return fetched, false, nil
+			}
+		}
+	}
+	manifest, err = s.Fetcher.FetchManifest(ctx)
+	return manifest, false, err
 }
 
 func (s *Synchronizer) publish(ctx context.Context, request SyncRequest, manifest, previous Manifest, hadPrevious bool, total, downloaded, reused uint64) (SyncResult, error) {

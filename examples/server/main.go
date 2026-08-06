@@ -44,7 +44,10 @@ func main() {
 	publicBase := flag.String("public-base", "", "public base URL; default derives from the request")
 	corsOrigin := flag.String("cors", "", "optional CORS allow-origin, e.g. http://localhost:8081 or *")
 	readers := flag.Int("readers", min(runtime.GOMAXPROCS(0), 8), "independent artifact readers")
-	memory := flag.Int64("max-memory", 16<<20, "per-reader tinySQL cache budget in bytes")
+	// 64 MiB matches docs/benchmark-results-berlin-2026-08-06.md's pool/cache
+	// sweep, which found it clears the tail latencies seen at 16/32 MiB on a
+	// regional-sized fixture.
+	memory := flag.Int64("max-memory", 64<<20, "per-reader tinySQL cache budget in bytes")
 	flag.Parse()
 	if *artifact == "" || *readers < 1 || *memory <= 0 {
 		fmt.Fprintln(os.Stderr, "usage: tinytiles-demo-server -artifact dataset.ttiles/ [-addr :8080]")
@@ -59,7 +62,12 @@ func main() {
 		Addr:              *addr,
 		Handler:           server.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// See cmd/tinytiles-server's WriteTimeout for the rationale: it bounds
+		// a stalled response write (a client reading a tile very slowly or not
+		// at all) without penalizing a legitimate long-lived keep-alive
+		// connection, since it resets per request.
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()

@@ -245,6 +245,24 @@ type Fetcher interface {
 	FetchTile(ctx context.Context, manifest Manifest, key TileKey) (Tile, error)
 }
 
+// ConditionalManifestFetcher is an optional Fetcher capability. Synchronizer
+// uses it, when available and a previous manifest for the requested dataset
+// is already cached, to revalidate that known revision instead of always
+// downloading the full manifest body — most calls from a client that polls
+// on a schedule find the dataset unchanged since the last call. *HTTPFetcher
+// implements this via a conditional GET; a Fetcher that does not implement
+// it is used exactly as before, with an unconditional FetchManifest call
+// every time.
+type ConditionalManifestFetcher interface {
+	// FetchManifestIfChanged revalidates knownRevision, which is never empty.
+	// unchanged reports whether the source confirmed that revision is still
+	// current. When unchanged is true, manifest is the zero value: the
+	// caller already has the real one and must keep using its own copy.
+	// When unchanged is false, manifest is what the caller must use instead
+	// (regardless of whether its Revision happens to match knownRevision).
+	FetchManifestIfChanged(ctx context.Context, knownRevision string) (manifest Manifest, unchanged bool, err error)
+}
+
 func validateIdentifier(kind, value string, maxBytes int) error {
 	value = strings.TrimSpace(value)
 	if value == "" {

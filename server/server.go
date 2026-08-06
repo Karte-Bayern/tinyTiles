@@ -5,6 +5,8 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tinytiles "github.com/Karte-Bayern/tinyTiles"
@@ -57,6 +60,13 @@ type Config struct {
 	ContentType     string
 	TileExtension   string
 	ContentEncoding string
+	// DEMEncoding declares a raster tileset as elevation data and is published
+	// in TileJSON as "encoding": one of "terrarium", "mapbox" (Terrain-RGB) or
+	// "custom". Empty infers it from the MBTiles format name or an "encoding"
+	// metadata row. Terrain sources commonly record only format=png, so this
+	// is how an existing DEM tileset is declared without rebuilding it. It is
+	// ignored for a vector tileset.
+	DEMEncoding string
 	// TileCacheBytes bounds the immutable in-process tile cache. In addition to
 	// hot payloads it retains compact SHA-256 values after payload eviction, so
 	// a repeated uncached read avoids rehashing the full tile. Zero selects
@@ -75,33 +85,58 @@ type Config struct {
 	PrefetchMaxTiles int
 }
 
-// Server is a handler factory for one immutable dataset revision. It is safe
-// for concurrent requests as long as its Dataset remains open.
+// Server is a handler factory. It is safe for concurrent requests as long as
+// its current Dataset remains open. Serving state is held in an immutable
+// generation, swapped atomically by SwapDataset so a running Server can move
+// to a newly published artifact revision without dropping in-flight requests.
 type Server struct {
-	dataset          *tinytiles.Dataset
-	datasetID        string
-	revision         string
-	createdAt        time.Time
-	metadata         map[string]string
-	contentType      string
-	tileExtension    string
-	tilePathSuffix   string
-	contentEncoding  string
-	publicBase       string
-	corsOrigin       string
-	tileCache        *tileCache
-	tileLoads        tileLoadGroup
-	prefetchWorkers  int
-	prefetchQueue    int
-	prefetchMaxTiles int
-	prefetchMu       sync.Mutex
-	prefetcher       *tilePrefetcher
-	prefetchClosed   bool
-	metadataPayload  []byte
-	metadataETag     string
-	manifestPayload  []byte
-	tileJSONPayload  []byte
-	tileJSONETag     string
+	datasetID               string
+	publicBase              string
+	corsOrigin              string
+	tileCacheBytes          int64
+	contentTypeOverride     string
+	tileExtensionOverride   string
+	contentEncodingOverride string
+	demEncodingOverride     string
+	prefetchWorkers         int
+	prefetchQueue           int
+	prefetchMaxTiles        int
+	prefetchMu              sync.Mutex
+	prefetcher              *tilePrefetcher
+	prefetchClosed          bool
+
+	gen atomic.Pointer[generation]
+}
+
+// generation is every piece of serving state derived from one Dataset. It is
+// never mutated after buildGeneration publishes it, so concurrent requests
+// can read a loaded *generation without locking.
+type generation struct {
+	dataset         *tinytiles.Dataset
+	revision        string
+	createdAt       time.Time
+	metadata        map[string]string
+	contentType     string
+	tileExtension   string
+	tilePathSuffix  string
+	contentEncoding string
+	demEncoding     string
+	tileCache       *tileCache
+	tileLoads       tileLoadGroup
+	metadataPayload []byte
+	metadataETag    string
+	manifestPayload []byte
+	tileJSONPayload []byte
+	tileJSONETag    string
+
+	// The *Gzip fields hold a precomputed gzip encoding of the corresponding
+	// payload above, or nil when compressing did not actually shrink it (a
+	// tiny metadata map, for example). Computing this once per generation
+	// instead of per request means a gzip-capable client gets fewer bytes on
+	// the wire at zero additional request-path CPU cost.
+	metadataPayloadGzip []byte
+	manifestPayloadGzip []byte
+	tileJSONPayloadGzip []byte
 }
 
 // New validates the static server configuration. It does not open or close
@@ -143,23 +178,76 @@ func New(config Config) (*Server, error) {
 	if prefetchMaxTiles == 0 {
 		prefetchMaxTiles = DefaultPrefetchMaxTiles
 	}
-	info := config.Dataset.Info()
+	server := &Server{
+		datasetID:               config.DatasetID,
+		publicBase:              publicBase,
+		corsOrigin:              corsOrigin,
+		tileCacheBytes:          tileCacheBytes,
+		contentTypeOverride:     config.ContentType,
+		tileExtensionOverride:   config.TileExtension,
+		contentEncodingOverride: config.ContentEncoding,
+		demEncodingOverride:     config.DEMEncoding,
+		prefetchWorkers:         prefetchWorkers,
+		prefetchQueue:           prefetchQueue,
+		prefetchMaxTiles:        prefetchMaxTiles,
+	}
+	gen, err := server.buildGeneration(config.Dataset)
+	if err != nil {
+		return nil, err
+	}
+	server.gen.Store(gen)
+	return server, nil
+}
+
+// SwapDataset atomically moves this Server from its current Dataset to
+// newDataset. In-flight requests started before the swap keep running against
+// the generation they already loaded; every request accepted after SwapDataset
+// returns serves newDataset. It returns the Dataset the Server served before
+// the swap so the caller can close it — Dataset.Close already waits for its
+// own in-flight lookups, so calling it immediately after a successful swap is
+// safe and does not need an additional drain delay.
+//
+// A rejected newDataset (for example, one that fails the same validation New
+// performs) leaves the Server serving its previous generation unchanged; the
+// caller keeps ownership of newDataset and should close it.
+func (s *Server) SwapDataset(newDataset *tinytiles.Dataset) (*tinytiles.Dataset, error) {
+	if s == nil {
+		return nil, errors.New("tinytiles server: server is nil")
+	}
+	if newDataset == nil {
+		return nil, errors.New("tinytiles server: new dataset is required")
+	}
+	gen, err := s.buildGeneration(newDataset)
+	if err != nil {
+		return nil, err
+	}
+	previous := s.gen.Swap(gen)
+	if previous == nil {
+		return nil, nil
+	}
+	return previous.dataset, nil
+}
+
+// buildGeneration performs the same artifact/metadata validation and payload
+// precomputation as New, against whichever Dataset is being made current.
+func (s *Server) buildGeneration(dataset *tinytiles.Dataset) (*generation, error) {
+	info := dataset.Info()
 	if len(info.TileDigestSHA256) != sha256.Size*2 {
 		return nil, errors.New("tinytiles server: artifact has no usable tile digest revision")
 	}
 	if _, err := hex.DecodeString(info.TileDigestSHA256); err != nil {
 		return nil, fmt.Errorf("tinytiles server: invalid tile digest revision: %w", err)
 	}
-	metadata, err := config.Dataset.Metadata()
+	metadata, err := dataset.Metadata()
 	if err != nil {
 		return nil, fmt.Errorf("tinytiles server: read metadata: %w", err)
 	}
-	format, err := inferTileFormat(metadata, config.ContentType, config.TileExtension)
+	format, err := inferTileFormat(metadata, s.contentTypeOverride, s.tileExtensionOverride, s.demEncodingOverride)
 	if err != nil {
 		return nil, err
 	}
 	contentType := format.contentType
-	contentEncoding := strings.TrimSpace(config.ContentEncoding)
+	contentEncoding := strings.TrimSpace(s.contentEncodingOverride)
 	if contentEncoding == "" && strings.EqualFold(metadata["kb:content_encoding"], "gzip") {
 		contentEncoding = "gzip"
 	}
@@ -167,48 +255,69 @@ func New(config Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tinytiles server: encode metadata: %w", err)
 	}
-	server := &Server{
-		dataset:          config.Dataset,
-		datasetID:        config.DatasetID,
-		revision:         info.TileDigestSHA256,
-		createdAt:        info.CreatedAt,
-		metadata:         metadata,
-		contentType:      contentType,
-		tileExtension:    format.extension,
-		tilePathSuffix:   "." + format.extension,
-		contentEncoding:  contentEncoding,
-		publicBase:       publicBase,
-		corsOrigin:       corsOrigin,
-		tileCache:        newTileCache(tileCacheBytes),
-		prefetchWorkers:  prefetchWorkers,
-		prefetchQueue:    prefetchQueue,
-		prefetchMaxTiles: prefetchMaxTiles,
-		metadataPayload:  metadataPayload,
-		metadataETag:     quoteETag(digest(metadataPayload)),
+	gen := &generation{
+		dataset:             dataset,
+		revision:            info.TileDigestSHA256,
+		createdAt:           info.CreatedAt,
+		metadata:            metadata,
+		contentType:         contentType,
+		tileExtension:       format.extension,
+		tilePathSuffix:      "." + format.extension,
+		contentEncoding:     contentEncoding,
+		demEncoding:         format.encoding,
+		tileCache:           newTileCache(s.tileCacheBytes),
+		metadataPayload:     metadataPayload,
+		metadataETag:        quoteETag(digest(metadataPayload)),
+		metadataPayloadGzip: gzipIfSmaller(metadataPayload),
 	}
-	if publicBase != "" {
+	if s.publicBase != "" {
 		manifest := offline.Manifest{
 			FormatVersion:    offline.ProtocolVersion,
-			Dataset:          server.datasetID,
-			Revision:         server.revision,
+			Dataset:          s.datasetID,
+			Revision:         gen.revision,
 			CoordinateSystem: "TMS",
-			TileURLTemplate:  publicBase + "/sync/tiles/{revision}/{z}/{x}/{y}",
-			ContentType:      server.contentType,
-			ContentEncoding:  server.contentEncoding,
-			CreatedAt:        server.createdAt,
+			TileURLTemplate:  s.publicBase + "/sync/tiles/{revision}/{z}/{x}/{y}",
+			ContentType:      gen.contentType,
+			ContentEncoding:  gen.contentEncoding,
+			CreatedAt:        gen.createdAt,
 		}
-		server.manifestPayload, err = json.Marshal(manifest)
+		gen.manifestPayload, err = json.Marshal(manifest)
 		if err != nil {
 			return nil, fmt.Errorf("tinytiles server: encode sync manifest: %w", err)
 		}
-		tileURL := server.xyzTileURL(publicBase)
-		server.tileJSONPayload, err = json.Marshal(tileJSON(server.metadata, tileURL, server.revision))
+		gen.manifestPayloadGzip = gzipIfSmaller(gen.manifestPayload)
+		tileURL := s.xyzTileURL(s.publicBase, gen)
+		gen.tileJSONPayload, err = json.Marshal(tileJSON(gen.metadata, tileURL, gen.revision, gen.contentType, gen.demEncoding))
 		if err != nil {
 			return nil, fmt.Errorf("tinytiles server: encode TileJSON: %w", err)
 		}
-		server.tileJSONETag = quoteETag(digest(server.tileJSONPayload))
+		gen.tileJSONETag = quoteETag(digest(gen.tileJSONPayload))
+		gen.tileJSONPayloadGzip = gzipIfSmaller(gen.tileJSONPayload)
 	}
-	return server, nil
+	return gen, nil
+}
+
+// gzipIfSmaller returns a gzip encoding of raw, or nil when the compressed
+// form is not actually smaller. gzip has a fixed ~20-byte header/trailer
+// overhead, so a tiny payload (an empty metadata map, for example) can come
+// out larger compressed than raw; nil tells writeJSON to fall back to raw
+// rather than serving a client bytes that "compression" made bigger.
+func gzipIfSmaller(raw []byte) []byte {
+	var buf bytes.Buffer
+	writer, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		return nil
+	}
+	if _, err := writer.Write(raw); err != nil {
+		return nil
+	}
+	if err := writer.Close(); err != nil {
+		return nil
+	}
+	if buf.Len() >= len(raw) {
+		return nil
+	}
+	return buf.Bytes()
 }
 
 // Close stops predictive-cache workers. It does not close the Dataset, which
@@ -234,7 +343,7 @@ func (s *Server) Close() {
 func (s *Server) routePrefetcher() *tilePrefetcher {
 	s.prefetchMu.Lock()
 	defer s.prefetchMu.Unlock()
-	if s.prefetchClosed || s.prefetchWorkers < 1 || s.tileCache == nil {
+	if s.prefetchClosed || s.prefetchWorkers < 1 || s.gen.Load().tileCache == nil {
 		return nil
 	}
 	if s.prefetcher == nil {
@@ -285,18 +394,19 @@ func (s *Server) serveXYZ(w http.ResponseWriter, request *http.Request) {
 		methodNotAllowed(w, http.MethodGet, http.MethodHead)
 		return
 	}
-	z, x, y, err := parseXYZPathWithSuffix(request.URL.Path, s.tilePathSuffix)
+	gen := s.gen.Load()
+	z, x, y, err := parseXYZPathWithSuffix(request.URL.Path, gen.tilePathSuffix)
 	if err != nil {
 		http.Error(w, "invalid XYZ tile coordinate", http.StatusBadRequest)
 		return
 	}
-	etag := tileCoordinateETag(s.revision, ":xyz:", z, x, y)
+	etag := tileCoordinateETag(gen.revision, ":xyz:", z, x, y)
 	if writeConditionalHeaders(w, request, etag, "public, max-age=31536000, immutable") {
 		return
 	}
 	// parseXYZPath has already validated z/x/y, so the row flip is safe here.
 	key := tiles.Key{Z: z, X: x, Y: (1 << z) - 1 - y}
-	tile, checksum, found, err := s.lookupTile(request.Context(), key)
+	tile, checksum, found, err := s.lookupTile(request.Context(), gen, key)
 	if err != nil {
 		http.Error(w, "tile lookup failed", http.StatusInternalServerError)
 		return
@@ -306,7 +416,7 @@ func (s *Server) serveXYZ(w http.ResponseWriter, request *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	s.writeTileHeaders(w, tile.Data, checksum, true)
+	writeTileHeaders(w, gen, tile.Data, checksum, true)
 	if request.Method == http.MethodHead {
 		return
 	}
@@ -318,8 +428,9 @@ func (s *Server) serveManifest(w http.ResponseWriter, request *http.Request) {
 		methodNotAllowed(w, http.MethodGet, http.MethodHead)
 		return
 	}
-	if s.manifestPayload != nil {
-		writeJSON(w, request, s.manifestPayload, quoteETag(s.revision), "no-cache")
+	gen := s.gen.Load()
+	if gen.manifestPayload != nil {
+		writeJSON(w, request, gen.manifestPayload, gen.manifestPayloadGzip, quoteETag(gen.revision), "no-cache")
 		return
 	}
 	baseURL, err := s.baseURL(request)
@@ -330,19 +441,19 @@ func (s *Server) serveManifest(w http.ResponseWriter, request *http.Request) {
 	manifest := offline.Manifest{
 		FormatVersion:    offline.ProtocolVersion,
 		Dataset:          s.datasetID,
-		Revision:         s.revision,
+		Revision:         gen.revision,
 		CoordinateSystem: "TMS",
 		TileURLTemplate:  baseURL + "/sync/tiles/{revision}/{z}/{x}/{y}",
-		ContentType:      s.contentType,
-		ContentEncoding:  s.contentEncoding,
-		CreatedAt:        s.createdAt,
+		ContentType:      gen.contentType,
+		ContentEncoding:  gen.contentEncoding,
+		CreatedAt:        gen.createdAt,
 	}
 	payload, err := json.Marshal(manifest)
 	if err != nil {
 		http.Error(w, "encode sync manifest", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, request, payload, quoteETag(s.revision), "no-cache")
+	writeJSON(w, request, payload, nil, quoteETag(gen.revision), "no-cache")
 }
 
 func (s *Server) serveTMSSync(w http.ResponseWriter, request *http.Request) {
@@ -350,8 +461,9 @@ func (s *Server) serveTMSSync(w http.ResponseWriter, request *http.Request) {
 		methodNotAllowed(w, http.MethodGet, http.MethodHead)
 		return
 	}
+	gen := s.gen.Load()
 	parts := strings.Split(strings.TrimPrefix(path.Clean(request.URL.Path), "/tiles/"), "/")
-	if len(parts) != 4 || parts[0] != s.revision {
+	if len(parts) != 4 || parts[0] != gen.revision {
 		http.NotFound(w, request)
 		return
 	}
@@ -360,11 +472,11 @@ func (s *Server) serveTMSSync(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "invalid TMS tile coordinate", http.StatusBadRequest)
 		return
 	}
-	etag := tileCoordinateETag(s.revision, ":tms:", key.Z, key.X, key.Y)
+	etag := tileCoordinateETag(gen.revision, ":tms:", key.Z, key.X, key.Y)
 	if writeConditionalHeaders(w, request, etag, "public, max-age=31536000, immutable") {
 		return
 	}
-	tile, checksum, found, err := s.lookupTile(request.Context(), key)
+	tile, checksum, found, err := s.lookupTile(request.Context(), gen, key)
 	if err != nil {
 		http.Error(w, "tile lookup failed", http.StatusInternalServerError)
 		return
@@ -376,7 +488,7 @@ func (s *Server) serveTMSSync(w http.ResponseWriter, request *http.Request) {
 	// Do not set HTTP Content-Encoding here. Browser Fetch may transparently
 	// decode it, whereas the offline protocol stores and checksums exact raw
 	// bytes. The protocol-specific header retains the representation instead.
-	s.writeTileHeaders(w, tile.Data, checksum, false)
+	writeTileHeaders(w, gen, tile.Data, checksum, false)
 	if request.Method == http.MethodHead {
 		return
 	}
@@ -388,8 +500,9 @@ func (s *Server) serveTileJSON(w http.ResponseWriter, request *http.Request) {
 		methodNotAllowed(w, http.MethodGet, http.MethodHead)
 		return
 	}
-	if s.tileJSONPayload != nil {
-		writeJSON(w, request, s.tileJSONPayload, s.tileJSONETag, "public, max-age=300, stale-while-revalidate=60")
+	gen := s.gen.Load()
+	if gen.tileJSONPayload != nil {
+		writeJSON(w, request, gen.tileJSONPayload, gen.tileJSONPayloadGzip, gen.tileJSONETag, "public, max-age=300, stale-while-revalidate=60")
 		return
 	}
 	baseURL, err := s.baseURL(request)
@@ -397,13 +510,13 @@ func (s *Server) serveTileJSON(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "invalid public base URL", http.StatusBadRequest)
 		return
 	}
-	tileURL := s.xyzTileURL(baseURL)
-	payload, err := json.Marshal(tileJSON(s.metadata, tileURL, s.revision))
+	tileURL := s.xyzTileURL(baseURL, gen)
+	payload, err := json.Marshal(tileJSON(gen.metadata, tileURL, gen.revision, gen.contentType, gen.demEncoding))
 	if err != nil {
 		http.Error(w, "encode TileJSON", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, request, payload, quoteETag(digest(payload)), "public, max-age=300, stale-while-revalidate=60")
+	writeJSON(w, request, payload, nil, quoteETag(digest(payload)), "public, max-age=300, stale-while-revalidate=60")
 }
 
 func (s *Server) serveMetadata(w http.ResponseWriter, request *http.Request) {
@@ -411,25 +524,26 @@ func (s *Server) serveMetadata(w http.ResponseWriter, request *http.Request) {
 		methodNotAllowed(w, http.MethodGet, http.MethodHead)
 		return
 	}
-	writeJSON(w, request, s.metadataPayload, s.metadataETag, "public, max-age=300, stale-while-revalidate=60")
+	gen := s.gen.Load()
+	writeJSON(w, request, gen.metadataPayload, gen.metadataPayloadGzip, gen.metadataETag, "public, max-age=300, stale-while-revalidate=60")
 }
 
-func (s *Server) lookupTile(ctx context.Context, key tiles.Key) (tiles.Tile, string, bool, error) {
+func (s *Server) lookupTile(ctx context.Context, gen *generation, key tiles.Key) (tiles.Tile, string, bool, error) {
 	// A deliberately disabled cache must retain the leanest possible direct
 	// lookup path. Coalescing is useful only when this Server can retain the
 	// resulting immutable payload or checksum for later requests.
-	if s.tileCache == nil {
-		data, checksum, found, err := s.loadTile(ctx, key)
+	if gen.tileCache == nil {
+		data, checksum, found, err := loadTile(ctx, gen, key)
 		if err != nil || !found {
 			return tiles.Tile{}, "", found, err
 		}
 		return tiles.Tile{Key: key, Data: data}, checksum, true, nil
 	}
-	if data, checksum, found := s.tileCache.get(key); found {
+	if data, checksum, found := gen.tileCache.get(key); found {
 		return tiles.Tile{Key: key, Data: data}, checksum, true, nil
 	}
-	data, checksum, found, err := s.tileLoads.do(ctx, key, func(loadCtx context.Context) ([]byte, string, bool, error) {
-		return s.loadTile(loadCtx, key)
+	data, checksum, found, err := gen.tileLoads.do(ctx, key, func(loadCtx context.Context) ([]byte, string, bool, error) {
+		return loadTile(loadCtx, gen, key)
 	})
 	if err != nil || !found {
 		return tiles.Tile{}, "", found, err
@@ -437,36 +551,45 @@ func (s *Server) lookupTile(ctx context.Context, key tiles.Key) (tiles.Tile, str
 	return tiles.Tile{Key: key, Data: data}, checksum, true, nil
 }
 
-func (s *Server) loadTile(ctx context.Context, key tiles.Key) ([]byte, string, bool, error) {
+func loadTile(ctx context.Context, gen *generation, key tiles.Key) ([]byte, string, bool, error) {
 	// A competing request can have filled the cache between the initial lookup
 	// and becoming this key's loader.
-	if data, checksum, found := s.tileCache.get(key); found {
+	if data, checksum, found := gen.tileCache.get(key); found {
 		return data, checksum, true, nil
 	}
-	checksum, checksumFound := s.tileCache.checksum(key)
-	tile, found, err := s.dataset.LookupTMS(ctx, key)
+	checksum, checksumFound := gen.tileCache.checksum(key)
+	tile, found, err := gen.dataset.LookupTMS(ctx, key)
 	if err != nil || !found {
 		return nil, "", found, err
 	}
 	if !checksumFound {
 		checksum = offline.Checksum(tile.Data)
 	}
-	s.tileCache.put(key, tile.Data, checksum)
+	gen.tileCache.put(key, tile.Data, checksum)
 	return tile.Data, checksum, true, nil
 }
 
-func (s *Server) writeTileHeaders(w http.ResponseWriter, data []byte, checksum string, browserTile bool) {
+func writeTileHeaders(w http.ResponseWriter, gen *generation, data []byte, checksum string, browserTile bool) {
 	header := w.Header()
-	setHeader(header, "Content-Type", s.contentType)
-	if s.contentEncoding != "" {
-		setHeader(header, headerTileContentEncoding, s.contentEncoding)
+	setHeader(header, "Content-Type", gen.contentType)
+	if gen.contentEncoding != "" {
+		setHeader(header, headerTileContentEncoding, gen.contentEncoding)
 		if browserTile {
-			setHeader(header, "Content-Encoding", s.contentEncoding)
+			setHeader(header, "Content-Encoding", gen.contentEncoding)
 		}
 	}
 	setHeader(header, headerTileChecksum, checksum)
 	setHeader(header, "Content-Length", strconv.Itoa(len(data)))
 }
+
+// corsPreflightMaxAgeSeconds is the longest a browser will actually cache a
+// preflight for (Chromium and Firefox both cap it at this value regardless of
+// a larger Access-Control-Max-Age), so tinyTiles asks for exactly that rather
+// than a smaller value that would just cost a client extra round trips. A map
+// client commonly fires many small concurrent cross-origin tile requests
+// while panning or zooming; without this header a browser may re-run the
+// OPTIONS preflight far more often than the actual CORS policy ever changes.
+const corsPreflightMaxAgeSeconds = "86400"
 
 func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -476,6 +599,7 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 			setHeader(header, "Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
 			setHeader(header, "Access-Control-Allow-Headers", "Content-Type, If-None-Match")
 			setHeader(header, "Access-Control-Expose-Headers", offline.HeaderTileChecksum+", "+offline.HeaderTileContentEncoding+", ETag")
+			setHeader(header, "Access-Control-Max-Age", corsPreflightMaxAgeSeconds)
 		}
 		if request.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -506,9 +630,9 @@ func (s *Server) baseURL(request *http.Request) (string, error) {
 }
 
 // xyzTileURL returns the canonical cache-busting XYZ URL advertised in
-// TileJSON. Its extension is selected once from MBTiles metadata at startup.
-func (s *Server) xyzTileURL(baseURL string) string {
-	return baseURL + "/tiles/{z}/{x}/{y}." + s.tileExtension + "?tinytiles_rev=" + url.QueryEscape(s.revision)
+// TileJSON. Its extension is selected from the generation's MBTiles metadata.
+func (s *Server) xyzTileURL(baseURL string, gen *generation) string {
+	return baseURL + "/tiles/{z}/{x}/{y}." + gen.tileExtension + "?tinytiles_rev=" + url.QueryEscape(gen.revision)
 }
 
 func validateDatasetID(dataset string) error {
@@ -645,14 +769,84 @@ func writeConditionalHeaders(w http.ResponseWriter, request *http.Request, etag,
 	return false
 }
 
-func writeJSON(w http.ResponseWriter, request *http.Request, payload []byte, etag, cacheControl string) {
+// writeJSON serves payload, or gzipPayload when the client's Accept-Encoding
+// allows gzip and buildGeneration found a precomputed encoding worth using.
+// gzipPayload may be nil: the dynamic per-request fallback paths (no
+// PublicBase configured, so the payload cannot be precomputed) simply skip
+// compression rather than paying a per-request gzip cost for an
+// already-uncommon configuration.
+func writeJSON(w http.ResponseWriter, request *http.Request, payload, gzipPayload []byte, etag, cacheControl string) {
 	header := w.Header()
 	setHeader(header, "Content-Type", "application/json; charset=utf-8")
-	setHeader(header, "Content-Length", strconv.Itoa(len(payload)))
+	body := payload
+	if gzipPayload != nil {
+		// A cache or proxy sitting between tinyTiles and the client must not
+		// serve one client's gzip response to another client that cannot
+		// decode it, or vice versa.
+		setHeader(header, "Vary", "Accept-Encoding")
+		if acceptsGzip(request) {
+			setHeader(header, "Content-Encoding", "gzip")
+			body = gzipPayload
+		}
+	}
+	setHeader(header, "Content-Length", strconv.Itoa(len(body)))
 	if writeConditionalHeaders(w, request, etag, cacheControl) || request.Method == http.MethodHead {
 		return
 	}
-	_, _ = w.Write(payload)
+	_, _ = w.Write(body)
+}
+
+// acceptsGzip reports whether the client's Accept-Encoding header allows a
+// gzip response. A missing header is treated as "no", the common defensive
+// choice (matching nginx's and Apache's default gzip modules): an RFC 7231
+// reader could argue a missing header permits any coding, but an unusual
+// client that omits Accept-Encoding entirely is exactly the client least
+// likely to expect a compressed body back.
+func acceptsGzip(request *http.Request) bool {
+	header := request.Header.Get("Accept-Encoding")
+	if header == "" {
+		return false
+	}
+	sawGzip, gzipAllowed := false, false
+	// Per RFC 7231 §5.3.4, a coding absent from a present Accept-Encoding
+	// field is *not* acceptable unless "*" says otherwise: an explicit
+	// "Accept-Encoding: identity" is the standard way a client asks for an
+	// uncompressed body, and gzip must not be forced on it.
+	sawWildcard, wildcardAllowed := false, false
+	for _, part := range strings.Split(header, ",") {
+		token, quality := parseAcceptEncodingToken(part)
+		switch token {
+		case "gzip":
+			sawGzip, gzipAllowed = true, quality != 0
+		case "*":
+			sawWildcard, wildcardAllowed = true, quality != 0
+		}
+	}
+	if sawGzip {
+		return gzipAllowed
+	}
+	return sawWildcard && wildcardAllowed
+}
+
+// parseAcceptEncodingToken splits one comma-separated Accept-Encoding item
+// into its lowercase coding name and quality value (default 1, per RFC 7231
+// §5.3.1). "gzip;q=0" is the standard way a client excludes an otherwise
+// acceptable coding, so the quality is what tinyTiles must honor, not just
+// the coding name's presence.
+func parseAcceptEncodingToken(part string) (token string, quality float64) {
+	quality = 1
+	fields := strings.Split(part, ";")
+	token = strings.ToLower(strings.TrimSpace(fields[0]))
+	for _, param := range fields[1:] {
+		value, found := strings.CutPrefix(strings.TrimSpace(param), "q=")
+		if !found {
+			continue
+		}
+		if parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
+			quality = parsed
+		}
+	}
+	return token, quality
 }
 
 func methodNotAllowed(w http.ResponseWriter, methods ...string) {
@@ -693,14 +887,14 @@ func digest(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func tileJSON(metadata map[string]string, tileURL, revision string) map[string]any {
+func tileJSON(metadata map[string]string, tileURL, revision, contentType, demEncoding string) map[string]any {
 	minZoom := integerMetadata(metadata, "minzoom", 0)
 	maxZoom := integerMetadata(metadata, "maxzoom", 22)
 	attribution := strings.TrimSpace(metadata["attribution"])
 	if attribution == "" {
 		attribution = "© OpenStreetMap contributors"
 	}
-	return map[string]any{
+	result := map[string]any{
 		"tilejson":           "3.0.0",
 		"name":               metadata["name"],
 		"description":        metadata["description"],
@@ -715,6 +909,48 @@ func tileJSON(metadata map[string]string, tileURL, revision string) map[string]a
 		"format":             metadata["format"],
 		"tinytiles:revision": revision,
 	}
+	// The standard MBTiles vector-tileset metadata row (key "json") carries
+	// vector_layers and, optionally, tilestats as an embedded JSON string —
+	// see https://github.com/mapbox/mbtiles-spec. tinyTiles relays it
+	// unchanged into the top-level TileJSON fields every vector-tile frontend
+	// (MapLibre GL JS, Mapbox GL JS, OpenLayers, Maputnik, deck.gl, ...)
+	// expects it in, rather than inventing layer semantics itself: the
+	// generator that wrote the source MBTiles already owns that content.
+	// It is only meaningful, and only sent, for a vector tileset.
+	if contentType == vectorTileContentType {
+		if vectorLayers, tilestats := vectorTilesetMetadata(metadata["json"]); vectorLayers != nil {
+			result["vector_layers"] = vectorLayers
+			if tilestats != nil {
+				result["tilestats"] = tilestats
+			}
+		}
+	}
+	// A raster DEM tileset is an ordinary PNG/WebP on the wire; only this
+	// field distinguishes elevation data from a plain raster, so a client can
+	// build a terrain/hillshade source instead of rendering the pixels
+	// literally. inferTileFormat has already cleared it for vector tilesets.
+	if demEncoding != "" {
+		result["encoding"] = demEncoding
+	}
+	return result
+}
+
+// vectorTilesetMetadata parses the MBTiles "json" metadata value. A missing
+// or malformed value is not an error: TileJSON generation must not fail
+// because an optional, best-effort field could not be relayed.
+func vectorTilesetMetadata(rawJSON string) (vectorLayers []any, tilestats any) {
+	rawJSON = strings.TrimSpace(rawJSON)
+	if rawJSON == "" {
+		return nil, nil
+	}
+	var decoded struct {
+		VectorLayers []any `json:"vector_layers"`
+		Tilestats    any   `json:"tilestats"`
+	}
+	if err := json.Unmarshal([]byte(rawJSON), &decoded); err != nil {
+		return nil, nil
+	}
+	return decoded.VectorLayers, decoded.Tilestats
 }
 
 func integerMetadata(metadata map[string]string, name string, fallback int) int {

@@ -53,10 +53,6 @@ func TestServerPrefetchRouteWarmsKnownTile(t *testing.T) {
 	server := testServer(t)
 	t.Cleanup(server.Close)
 	point := RoutePoint{Latitude: 40, Longitude: -45}
-	xyz, err := routePointXYZ(point, 2)
-	if err != nil || xyz != (xyzPoint{x: 1, y: 1}) {
-		t.Fatalf("route point xyz=%#v err=%v", xyz, err)
-	}
 	result, err := server.PrefetchRoute(t.Context(), []RoutePoint{point}, RoutePrefetchOptions{Zoom: 2})
 	if err != nil || result.Queued != 1 || result.Truncated {
 		t.Fatalf("prefetch result=%#v err=%v", result, err)
@@ -64,7 +60,7 @@ func TestServerPrefetchRouteWarmsKnownTile(t *testing.T) {
 	key := tiles.Key{Z: 2, X: 1, Y: 2}
 	deadline := time.Now().Add(time.Second)
 	for {
-		data, _, found := server.tileCache.get(key)
+		data, _, found := server.gen.Load().tileCache.get(key)
 		if found {
 			if !bytes.Equal(data, []byte{1, 2, 3}) {
 				t.Fatalf("prefetched data=%x", data)

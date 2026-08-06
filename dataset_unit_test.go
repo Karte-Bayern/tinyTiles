@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,10 +12,17 @@ import (
 )
 
 type memoryReader struct {
-	tiles map[tiles.Key][]byte
+	tiles     map[tiles.Key][]byte
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
-func (r *memoryReader) Close() error { return nil }
+func (r *memoryReader) Close() error {
+	if r.closed != nil {
+		r.closeOnce.Do(func() { close(r.closed) })
+	}
+	return nil
+}
 
 func (r *memoryReader) Info() tiles.ArtifactInfo { return tiles.ArtifactInfo{} }
 
@@ -127,5 +135,102 @@ func TestDatasetCloseUnblocksWaitingLookup(t *testing.T) {
 	}
 	if err := <-done; !errors.Is(err, ErrClosed) {
 		t.Fatalf("waiting lookup error = %v, want ErrClosed", err)
+	}
+}
+
+func TestDatasetCloseDrainsReaderReturnedDuringClose(t *testing.T) {
+	reader := &memoryReader{tiles: map[tiles.Key][]byte{}, closed: make(chan struct{})}
+	dataset := &Dataset{readers: make(chan tiles.Reader, 1), done: make(chan struct{})}
+	dataset.readers <- reader
+
+	borrowed, err := dataset.acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- dataset.Close() }()
+	waitForDatasetClose(t, dataset)
+	select {
+	case <-reader.closed:
+		t.Fatal("reader closed before its active lookup returned it")
+	default:
+	}
+
+	dataset.release(borrowed)
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-reader.closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not close reader returned by an active lookup")
+	}
+}
+
+func TestDatasetPrefersRecentlyReturnedReader(t *testing.T) {
+	hot := &memoryReader{tiles: map[tiles.Key][]byte{}}
+	other := &memoryReader{tiles: map[tiles.Key][]byte{}}
+	dataset := &Dataset{
+		hotReader: make(chan tiles.Reader, 1),
+		readers:   make(chan tiles.Reader, 1),
+		done:      make(chan struct{}),
+	}
+	dataset.hotReader <- hot
+	dataset.readers <- other
+
+	first, err := dataset.acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != hot {
+		t.Fatalf("first reader = %T %p, want hot reader %p", first, first, hot)
+	}
+	dataset.release(first)
+
+	second, err := dataset.acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != hot {
+		t.Fatalf("second reader = %T %p, want recently returned reader %p", second, second, hot)
+	}
+	dataset.release(second)
+	if err := dataset.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDatasetCloseDrainsHotReader(t *testing.T) {
+	reader := &memoryReader{tiles: map[tiles.Key][]byte{}, closed: make(chan struct{})}
+	dataset := &Dataset{
+		hotReader: make(chan tiles.Reader, 1),
+		readers:   make(chan tiles.Reader),
+		done:      make(chan struct{}),
+	}
+	dataset.hotReader <- reader
+	if err := dataset.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-reader.closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not close hot reader")
+	}
+}
+
+func waitForDatasetClose(t *testing.T, dataset *Dataset) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		dataset.mu.RLock()
+		closed := dataset.closed
+		dataset.mu.RUnlock()
+		if closed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not begin")
+		}
+		runtime.Gosched()
 	}
 }

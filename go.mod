@@ -3,7 +3,7 @@ module github.com/Karte-Bayern/tinyTiles
 go 1.26.5
 
 require (
-	github.com/SimonWaldherr/tinySQL v0.28.0
+	github.com/SimonWaldherr/tinySQL v0.28.1
 	modernc.org/sqlite v1.56.0
 )
 

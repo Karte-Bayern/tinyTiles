@@ -42,41 +42,70 @@ type HTTPFetcher struct {
 }
 
 func (f *HTTPFetcher) FetchManifest(ctx context.Context) (Manifest, error) {
+	manifest, _, err := f.fetchManifest(ctx, "")
+	return manifest, err
+}
+
+// FetchManifestIfChanged implements ConditionalManifestFetcher. Most sync
+// calls in a client that polls on a schedule find the dataset unchanged
+// since the last call; revalidating a known revision costs a 304 response
+// instead of the full manifest body every time.
+func (f *HTTPFetcher) FetchManifestIfChanged(ctx context.Context, knownRevision string) (Manifest, bool, error) {
+	if knownRevision == "" {
+		return Manifest{}, false, errors.New("known revision is empty")
+	}
+	return f.fetchManifest(ctx, knownRevision)
+}
+
+// fetchManifest is shared by FetchManifest and FetchManifestIfChanged.
+// knownRevision empty means an unconditional fetch: the server's manifest
+// ETag is exactly its quoted revision (see server.tileCoordinateETag's
+// sibling in the server package), so a client that already validated a
+// revision can revalidate it with nothing more than that string.
+func (f *HTTPFetcher) fetchManifest(ctx context.Context, knownRevision string) (manifest Manifest, unchanged bool, err error) {
 	endpoint, err := f.resolveManifestURL()
 	if err != nil {
-		return Manifest{}, err
+		return Manifest{}, false, err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
-		return Manifest{}, err
+		return Manifest{}, false, err
 	}
 	request.Header.Set("Accept", "application/json")
+	if knownRevision != "" {
+		request.Header.Set("If-None-Match", `"`+knownRevision+`"`)
+	}
 	f.applyHeaders(request)
 	response, err := f.httpClient().Do(request)
 	if err != nil {
-		return Manifest{}, err
+		return Manifest{}, false, err
 	}
 	defer response.Body.Close()
+	if knownRevision != "" && response.StatusCode == http.StatusNotModified {
+		// Drain the (normally empty) body so the connection returns to the
+		// pool instead of being closed under net/http's keep-alive rules.
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, f.maxManifestSize()))
+		return Manifest{}, true, nil
+	}
 	if response.StatusCode != http.StatusOK {
-		return Manifest{}, httpStatusError("fetch manifest", response)
+		return Manifest{}, false, httpStatusError("fetch manifest", response)
 	}
 	body, err := readLimitedHint(response.Body, f.maxManifestSize(), response.ContentLength)
 	if err != nil {
-		return Manifest{}, fmt.Errorf("read manifest: %w", err)
+		return Manifest{}, false, fmt.Errorf("read manifest: %w", err)
 	}
-	var manifest Manifest
 	if err := json.Unmarshal(body, &manifest); err != nil {
-		return Manifest{}, fmt.Errorf("decode manifest JSON: %w", err)
+		return Manifest{}, false, fmt.Errorf("decode manifest JSON: %w", err)
 	}
 	if err := manifest.Validate(); err != nil {
-		return Manifest{}, err
+		return Manifest{}, false, err
 	}
-	if resolved, err := resolveTemplateURL(endpoint, manifest.TileURLTemplate); err != nil {
-		return Manifest{}, err
-	} else {
-		manifest.TileURLTemplate = resolved
+	resolved, err := resolveTemplateURL(endpoint, manifest.TileURLTemplate)
+	if err != nil {
+		return Manifest{}, false, err
 	}
-	return manifest, nil
+	manifest.TileURLTemplate = resolved
+	return manifest, false, nil
 }
 
 func resolveTemplateURL(base *url.URL, raw string) (string, error) {

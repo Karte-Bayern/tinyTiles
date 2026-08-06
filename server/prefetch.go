@@ -3,9 +3,9 @@ package server
 import (
 	"context"
 	"errors"
-	"math"
 	"sync"
 
+	"github.com/Karte-Bayern/tinyTiles/offline"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
 
@@ -21,7 +21,6 @@ const (
 	// from their start, which prioritizes the part a navigator reaches next.
 	DefaultPrefetchMaxTiles = 1024
 	maxRoutePrefetchRadius  = 8
-	webMercatorLatitude     = 85.0511287798066
 )
 
 var (
@@ -31,10 +30,10 @@ var (
 )
 
 // RoutePoint is one WGS84 coordinate in the order produced by routing APIs.
-type RoutePoint struct {
-	Latitude  float64
-	Longitude float64
-}
+// It is the same type a client uses to build offline.RouteSyncRequest, so a
+// trusted application can compute one route corridor and both prefetch it on
+// the server and synchronize it to a mobile client with the same points.
+type RoutePoint = offline.RoutePoint
 
 // RoutePrefetchOptions controls the bounded prediction around a route.
 // Zoom is required. Radius warms neighboring tiles around the route center
@@ -59,7 +58,7 @@ type PrefetchResult struct {
 // than an unauthenticated HTTP route: callers normally invoke it after a
 // trusted routing result has been computed. Server.Close stops the workers.
 func (s *Server) PrefetchRoute(ctx context.Context, route []RoutePoint, options RoutePrefetchOptions) (PrefetchResult, error) {
-	if s == nil || s.tileCache == nil {
+	if s == nil || s.gen.Load().tileCache == nil {
 		return PrefetchResult{}, ErrPredictiveCachingDisabled
 	}
 	if err := ctx.Err(); err != nil {
@@ -103,117 +102,19 @@ func (s *Server) PrefetchRoute(ctx context.Context, route []RoutePoint, options 
 	return result, nil
 }
 
+// routeTileKeys rasterizes route into tinySQL TMS keys via the shared,
+// dependency-free implementation in the offline package, which a client also
+// uses to build a RouteSyncRequest for the same corridor.
 func routeTileKeys(route []RoutePoint, zoom, radius, maxTiles int) ([]tiles.Key, bool, error) {
-	if maxTiles < 1 {
-		return nil, true, nil
+	offlineKeys, truncated, err := offline.RouteTileKeys(route, zoom, radius, maxTiles)
+	if err != nil {
+		return nil, false, err
 	}
-	points := make([]xyzPoint, len(route))
-	for index, point := range route {
-		xyz, err := routePointXYZ(point, zoom)
-		if err != nil {
-			return nil, false, err
-		}
-		points[index] = xyz
-	}
-	n := 1 << zoom
-	seen := make(map[tiles.Key]struct{}, min(maxTiles, 256))
-	keys := make([]tiles.Key, 0, min(maxTiles, 256))
-	truncated := false
-	emit := func(x, y int) bool {
-		for offsetY := -radius; offsetY <= radius; offsetY++ {
-			yy := y + offsetY
-			if yy < 0 || yy >= n {
-				continue
-			}
-			for offsetX := -radius; offsetX <= radius; offsetX++ {
-				xx := x + offsetX
-				if xx < 0 || xx >= n {
-					continue
-				}
-				key := tiles.Key{Z: zoom, X: xx, Y: n - 1 - yy}
-				if _, exists := seen[key]; exists {
-					continue
-				}
-				if len(keys) == maxTiles {
-					truncated = true
-					return false
-				}
-				seen[key] = struct{}{}
-				keys = append(keys, key)
-			}
-		}
-		return true
-	}
-	if len(points) == 1 {
-		emit(points[0].x, points[0].y)
-		return keys, truncated, nil
-	}
-	for index := 1; index < len(points); index++ {
-		start, end := points[index-1], points[index]
-		// Follow the short world-wrapping segment at the antimeridian instead
-		// of warming almost every tile around the globe.
-		if abs(end.x-start.x) > n/2 {
-			if end.x > start.x {
-				end.x -= n
-			} else {
-				end.x += n
-			}
-		}
-		if !rasterizeRouteSegment(start, end, func(x, y int) bool {
-			return emit((x%n+n)%n, y)
-		}) {
-			break
-		}
+	keys := make([]tiles.Key, len(offlineKeys))
+	for index, key := range offlineKeys {
+		keys[index] = tiles.Key{Z: key.Z, X: key.X, Y: key.Y}
 	}
 	return keys, truncated, nil
-}
-
-type xyzPoint struct{ x, y int }
-
-func routePointXYZ(point RoutePoint, zoom int) (xyzPoint, error) {
-	if math.IsNaN(point.Latitude) || math.IsInf(point.Latitude, 0) || point.Latitude < -90 || point.Latitude > 90 || math.IsNaN(point.Longitude) || math.IsInf(point.Longitude, 0) || point.Longitude < -180 || point.Longitude > 180 {
-		return xyzPoint{}, errors.New("tinytiles server: route coordinate is outside WGS84 bounds")
-	}
-	latitude := math.Max(-webMercatorLatitude, math.Min(webMercatorLatitude, point.Latitude))
-	n := float64(uint64(1) << zoom)
-	x := int(math.Floor((point.Longitude + 180) / 360 * n))
-	latRadians := latitude * math.Pi / 180
-	y := int(math.Floor((1 - math.Log(math.Tan(latRadians)+1/math.Cos(latRadians))/math.Pi) / 2 * n))
-	limit := int(n) - 1
-	return xyzPoint{x: min(max(x, 0), limit), y: min(max(y, 0), limit)}, nil
-}
-
-// rasterizeRouteSegment visits every grid cell crossed by a segment, in route
-// order. Bresenham's integer form is deterministic and avoids accumulating
-// floating-point error on long routes.
-func rasterizeRouteSegment(start, end xyzPoint, visit func(x, y int) bool) bool {
-	x, y := start.x, start.y
-	dx, dy := abs(end.x-start.x), -abs(end.y-start.y)
-	sx, sy := -1, -1
-	if x < end.x {
-		sx = 1
-	}
-	if y < end.y {
-		sy = 1
-	}
-	err := dx + dy
-	for {
-		if !visit(x, y) {
-			return false
-		}
-		if x == end.x && y == end.y {
-			return true
-		}
-		twice := 2 * err
-		if twice >= dy {
-			err += dy
-			x += sx
-		}
-		if twice <= dx {
-			err += dx
-			y += sy
-		}
-	}
 }
 
 type tilePrefetcher struct {
@@ -243,7 +144,8 @@ func newTilePrefetcher(server *Server, workers, queue int) *tilePrefetcher {
 				case <-prefetcher.stop:
 					return
 				case key := <-prefetcher.jobs:
-					_, _, _, _ = prefetcher.server.lookupTile(context.Background(), key)
+					gen := prefetcher.server.gen.Load()
+					_, _, _, _ = prefetcher.server.lookupTile(context.Background(), gen, key)
 				}
 			}
 		}()
@@ -275,11 +177,4 @@ func (p *tilePrefetcher) close() {
 	close(p.stop)
 	p.mu.Unlock()
 	p.done.Wait()
-}
-
-func abs(value int) int {
-	if value < 0 {
-		return -value
-	}
-	return value
 }

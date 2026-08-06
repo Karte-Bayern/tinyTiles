@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"os"
 	"os/signal"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	tinytiles "github.com/Karte-Bayern/tinyTiles"
+	"github.com/Karte-Bayern/tinyTiles/internal/pmtiles"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 	_ "modernc.org/sqlite"
 )
@@ -59,7 +61,7 @@ func commandImport(args []string, stdout, stderr io.Writer) int {
 	compact := fs.Bool("compact", false, "losslessly deduplicate equal tile payloads into a normalized artifact (uses temporary disk)")
 	replace := fs.Bool("replace", false, "atomically replace an existing artifact")
 	if fs.Parse(args) != nil || fs.NArg() != 2 {
-		fmt.Fprintln(stderr, "usage: tinytiles import [flags] source.mbtiles dataset.ttiles/")
+		fmt.Fprintln(stderr, "usage: tinytiles import [flags] source.mbtiles|source.pmtiles dataset.ttiles/")
 		return 2
 	}
 	artifactSchema, err := parseSchema(*schema)
@@ -94,7 +96,7 @@ func commandImport(args []string, stdout, stderr io.Writer) int {
 // into the artifact directory. samePath catches ordinary and symlink aliases;
 // os.SameFile additionally catches hard links on filesystems that support them.
 func validateImportPaths(source, artifact string) error {
-	if err := requireRegularFile("MBTiles source", source); err != nil {
+	if err := requireRegularFile("import source", source); err != nil {
 		return err
 	}
 	same, err := samePath(source, artifact)
@@ -102,15 +104,15 @@ func validateImportPaths(source, artifact string) error {
 		return fmt.Errorf("resolve source and artifact paths: %w", err)
 	}
 	if same {
-		return fmt.Errorf("artifact path %q must not refer to MBTiles source %q", artifact, source)
+		return fmt.Errorf("artifact path %q must not refer to import source %q", artifact, source)
 	}
 	sourceInfo, err := os.Stat(source)
 	if err != nil {
-		return fmt.Errorf("stat MBTiles source %q: %w", source, err)
+		return fmt.Errorf("stat import source %q: %w", source, err)
 	}
 	artifactInfo, err := os.Stat(artifact)
 	if err == nil && os.SameFile(sourceInfo, artifactInfo) {
-		return fmt.Errorf("artifact path %q must not refer to MBTiles source %q", artifact, source)
+		return fmt.Errorf("artifact path %q must not refer to import source %q", artifact, source)
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat artifact path %q: %w", artifact, err)
@@ -118,12 +120,12 @@ func validateImportPaths(source, artifact string) error {
 	if within, err := pathWithin(source, artifact); err != nil {
 		return fmt.Errorf("resolve source and artifact paths: %w", err)
 	} else if within {
-		return fmt.Errorf("artifact path %q must not contain MBTiles source %q", artifact, source)
+		return fmt.Errorf("artifact path %q must not contain import source %q", artifact, source)
 	}
 	if within, err := pathWithin(artifact, source); err != nil {
 		return fmt.Errorf("resolve source and artifact paths: %w", err)
 	} else if within {
-		return fmt.Errorf("artifact path %q must not be inside MBTiles source %q", artifact, source)
+		return fmt.Errorf("artifact path %q must not be inside import source %q", artifact, source)
 	}
 	return nil
 }
@@ -143,6 +145,31 @@ func importArtifactWithProvenanceAndCompact(ctx context.Context, source, artifac
 	}
 	if compact && schema == tiles.SchemaFlat {
 		return nil, errors.New("compact import requires schema auto or normalized; schema flat would discard payload deduplication")
+	}
+	// A PMTiles v3 archive is converted to a temporary flat MBTiles source
+	// first, so it reaches exactly the same validated, atomically published
+	// import path as any other source. Detection is by header magic, not file
+	// extension.
+	if pmtiles.IsArchive(source) {
+		fmt.Fprintln(stdout, "phase=pmtiles")
+		staging, err := stagePMTiles(ctx, source, artifact)
+		if err != nil {
+			return nil, err
+		}
+		defer staging.Close()
+		fmt.Fprintln(stdout, pmtilesStatsLine(staging.Stats))
+		provenance = pmtilesImportProvenance(provenance, source, staging.Stats)
+		source = staging.Path
+	}
+	if !compact {
+		resolvedSchema, resolution, err := resolveAutoArtifactSchema(ctx, source, schema)
+		if err != nil {
+			return nil, err
+		}
+		schema = resolvedSchema
+		if resolution != "" {
+			fmt.Fprintln(stdout, resolution)
+		}
 	}
 	if batch == 0 {
 		var err error
@@ -184,6 +211,58 @@ func importArtifactWithProvenanceAndCompact(ctx context.Context, source, artifac
 		}
 	}
 	return result, err
+}
+
+// resolveAutoArtifactSchema avoids the normalized map→image join on the
+// serving path when a normalized MBTiles source has no tile_id reuse at all.
+// It deliberately applies only to automatic, non-compact imports: an explicit
+// representation remains the caller's choice, and --compact must retain its
+// normalized deduplication table even before the compact staging source exists.
+func resolveAutoArtifactSchema(ctx context.Context, source string, schema tiles.Schema) (tiles.Schema, string, error) {
+	if schema != tiles.SchemaAuto {
+		return schema, "", nil
+	}
+	if err := ctx.Err(); err != nil {
+		return schema, "", err
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.Clean(source)+"?mode=ro&immutable=1&cache=private")
+	if err != nil {
+		return schema, "", fmt.Errorf("open MBTiles source for schema resolution: %w", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		return schema, "", fmt.Errorf("ping MBTiles source for schema resolution: %w", err)
+	}
+	flat, err := sqliteTableExistsContext(ctx, db, "tiles")
+	if err != nil {
+		return schema, "", err
+	}
+	if flat {
+		return schema, "", nil
+	}
+	mapTable, err := sqliteTableExistsContext(ctx, db, "map")
+	if err != nil {
+		return schema, "", err
+	}
+	images, err := sqliteTableExistsContext(ctx, db, "images")
+	if err != nil {
+		return schema, "", err
+	}
+	if !mapTable || !images {
+		// Defer malformed or unsupported source diagnostics to the importer,
+		// which has the complete source-schema error handling.
+		return schema, "", nil
+	}
+	var mapRows, uniqueTileIDs int64
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), COUNT(DISTINCT tile_id) FROM map`).Scan(&mapRows, &uniqueTileIDs); err != nil {
+		return schema, "", fmt.Errorf("measure normalized MBTiles tile reuse for schema resolution: %w", err)
+	}
+	if mapRows == uniqueTileIDs {
+		return tiles.SchemaFlat, fmt.Sprintf("schema-resolution requested=auto resolved=flat map=%d unique-tile-ids=%d", mapRows, uniqueTileIDs), nil
+	}
+	return schema, fmt.Sprintf("schema-resolution requested=auto resolved=auto map=%d unique-tile-ids=%d", mapRows, uniqueTileIDs), nil
 }
 
 // autoImportBatchSize selects a fast, bounded import batch without adding a
@@ -293,39 +372,91 @@ func commandBenchmark(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	source := fs.String("source", "", "SQLite MBTiles reference")
 	artifact := fs.String("artifact", "", "published tinyTiles artifact")
-	requests := fs.Int("requests", 512, "number of deterministic warm lookups")
+	requests := fs.Int("requests", 512, "number of deterministic benchmark lookups")
 	memory := fs.Int64("max-memory", tinytiles.DefaultReaderMemoryBytes, "per-reader cache budget in bytes")
 	readers := fs.Int("readers", 8, "independent readers used for parallel measurements")
-	if fs.Parse(args) != nil || *source == "" || *artifact == "" || *requests < 10 || *readers < 1 {
+	cold := fs.Bool("cold", false, "measure a fresh-reader corpus before parity and warm-up")
+	coldRuns := fs.Int("cold-runs", 5, "complete fresh-reader corpus runs per profile; percentile results use their median")
+	coldMaxP95Ratio := fs.Float64("cold-max-p95-ratio", 0, "fail fresh-reader corpus measurements above this tinyTiles/SQLite p95 ratio (0 disables; nonzero enables --cold)")
+	coldRequest := fs.Bool("cold-request", false, "measure one fresh SQLite connection or Dataset per requested tile before parity and warm-up")
+	coldRequestMaxP95Ratio := fs.Float64("cold-request-max-p95-ratio", 0, "fail application-cold request measurements above this tinyTiles/SQLite lookup p95 ratio (0 disables; nonzero enables --cold-request)")
+	seed := fs.Int64("seed", 0x71A5, "deterministic corpus shuffle seed")
+	if fs.Parse(args) != nil || *source == "" || *artifact == "" || *requests < 10 || *readers < 1 || *memory <= 0 || *coldRuns < 1 || *coldMaxP95Ratio < 0 || *coldRequestMaxP95Ratio < 0 || math.IsNaN(*coldMaxP95Ratio) || math.IsInf(*coldMaxP95Ratio, 0) || math.IsNaN(*coldRequestMaxP95Ratio) || math.IsInf(*coldRequestMaxP95Ratio, 0) {
 		fmt.Fprintln(stderr, "usage: tinytiles benchmark --source source.mbtiles --artifact dataset.ttiles/ [--requests 512]")
 		return 2
 	}
+	coldEnabled := *cold || *coldMaxP95Ratio > 0
+	coldRequestEnabled := *coldRequest || *coldRequestMaxP95Ratio > 0
 	sqliteOpenStart := time.Now()
-	db, err := sql.Open("sqlite", "file:"+filepath.Clean(*source)+"?mode=ro&immutable=1")
+	db, err := openBenchmarkSQLite(*source, *readers)
 	if err != nil {
 		fmt.Fprintf(stderr, "tinytiles benchmark: open SQLite: %v\n", err)
-		return 1
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(*readers)
-	db.SetMaxIdleConns(*readers)
-	if err := db.PingContext(context.Background()); err != nil {
-		fmt.Fprintf(stderr, "tinytiles benchmark: ping SQLite: %v\n", err)
 		return 1
 	}
 	sqliteOpen := time.Since(sqliteOpenStart)
 	benchmarkSource, err := detectBenchmarkSource(db)
 	if err != nil {
 		fmt.Fprintf(stderr, "tinytiles benchmark: %v\n", err)
+		_ = db.Close()
 		return 1
 	}
-	corpus, err := benchmarkCorpus(db, benchmarkSource, *requests)
+	corpus, err := benchmarkCorpus(db, benchmarkSource, *requests, *seed)
 	if err != nil {
 		fmt.Fprintf(stderr, "tinytiles benchmark: %v\n", err)
+		_ = db.Close()
 		return 1
 	}
-	rng := rand.New(rand.NewSource(0x71A5))
-	rng.Shuffle(len(corpus), func(i, j int) { corpus[i], corpus[j] = corpus[j], corpus[i] })
+	if err := randomizeUniqueBenchmarkCorpus(corpus, *seed); err != nil {
+		fmt.Fprintf(stderr, "tinytiles benchmark: %v\n", err)
+		_ = db.Close()
+		return 1
+	}
+
+	// A fresh-reader corpus profile must not inherit the corpus selection connection, a
+	// prepared statement, artifact reader pages, parity reads or a warm-up.
+	// Closing this connection resets modernc SQLite's per-connection page cache;
+	// the OS filesystem cache deliberately remains outside this benchmark's
+	// control and is reported as such below.
+	var coldMeasurements []freshReaderCorpusMeasurement
+	var coldFailures []coldP95Failure
+	var coldRequestResult *coldRequestMeasurement
+	var coldRequestFailure *coldRequestP95Failure
+	if coldEnabled || coldRequestEnabled {
+		if err := db.Close(); err != nil {
+			fmt.Fprintf(stderr, "tinytiles benchmark: close corpus SQLite reader before cold measurements: %v\n", err)
+			return 1
+		}
+		db = nil
+		if coldRequestEnabled {
+			measurement, err := measureColdRequests(*source, *artifact, benchmarkSource, corpus, *memory, *coldRuns)
+			if err != nil {
+				fmt.Fprintf(stderr, "tinytiles benchmark: application-cold request: %v\n", err)
+				return 1
+			}
+			coldRequestResult = &measurement
+			if *coldRequestMaxP95Ratio > 0 && float64(measurement.tiny.lookup.p95) > float64(measurement.sqlite.lookup.p95)*(*coldRequestMaxP95Ratio) {
+				coldRequestFailure = &coldRequestP95Failure{sqlite: measurement.sqlite.lookup.p95, tiny: measurement.tiny.lookup.p95}
+			}
+		}
+		if coldEnabled {
+			coldMeasurements, err = measureFreshReaderCorpus(*source, *artifact, benchmarkSource, corpus, *memory, benchmarkReaderCounts(*readers), *coldRuns)
+			if err != nil {
+				fmt.Fprintf(stderr, "tinytiles benchmark: fresh-reader corpus: %v\n", err)
+				return 1
+			}
+			if *coldMaxP95Ratio > 0 {
+				coldFailures = coldP95Failures(coldMeasurements, *coldMaxP95Ratio)
+			}
+		}
+		// Reopen a normal reference connection for the established parity and
+		// warmed profile. This preserves the cold phase's isolation.
+		db, err = openBenchmarkSQLite(*source, *readers)
+		if err != nil {
+			fmt.Fprintf(stderr, "tinytiles benchmark: reopen SQLite after fresh-reader corpus: %v\n", err)
+			return 1
+		}
+	}
+	defer db.Close()
 	tinyOpenStart := time.Now()
 	dataset, err := tinytiles.Open(context.Background(), *artifact, tinytiles.OpenOptions{Readers: *readers, MaxMemoryBytes: *memory})
 	if err != nil {
@@ -364,7 +495,8 @@ func commandBenchmark(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tinytiles benchmark: parity: %v\n", err)
 		return 1
 	}
-	fullTiles, fullMetadata, err := verifyFullBenchmarkParity(db, benchmarkSource, dataset.Info())
+	artifactInfo := dataset.Info()
+	fullTiles, fullMetadata, err := verifyFullBenchmarkParity(db, benchmarkSource, artifactInfo)
 	if err != nil {
 		fmt.Fprintf(stderr, "tinytiles benchmark: full parity: %v\n", err)
 		return 1
@@ -394,11 +526,27 @@ func commandBenchmark(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, "resource\tSQLite\ttinyTiles")
 	fmt.Fprintf(stdout, "open\t%s\t%s\n", sqliteOpen, tinyOpen)
+	fmt.Fprintf(stdout, "schema\t%s\t%s\n", benchmarkSource.schema, artifactInfo.Schema)
 	fmt.Fprintf(stdout, "bytes\t%d\t%d\n", sourceBytes, artifactBytes)
 	fmt.Fprintf(stdout, "size-ratio\t1.000\t%.3f\n", float64(artifactBytes)/float64(sourceBytes))
 	fmt.Fprintf(stdout, "sample-parity\t%d/%d\tPASS\n", len(corpus), len(corpus))
 	fmt.Fprintf(stdout, "full-parity\ttiles=%d metadata=%d\tPASS\n", fullTiles, fullMetadata)
+	if coldEnabled {
+		fmt.Fprintf(stdout, "cold-mode\tfresh Dataset readers and SQLite statements per profile; randomized unique corpus; OS filesystem cache not forcibly evicted\tseed=%d unique=%d runs=%d percentile-aggregation=median\n", *seed, len(corpus), *coldRuns)
+		fmt.Fprintf(stdout, "cold-aggregation\tmedian of per-run p50/p95/p99 across %d complete fresh-reader runs; SQLite/tinyTiles measurement order alternates; gate uses median p95\n", *coldRuns)
+	}
+	if coldRequestResult != nil {
+		fmt.Fprintf(stdout, "cold-request-mode\tone fresh SQLite connection or Dataset per requested tile; artifact validated once before timing; randomized unique corpus; OS filesystem cache not forcibly evicted\tseed=%d unique=%d runs=%d percentile-aggregation=median\n", *seed, len(corpus), *coldRuns)
+		fmt.Fprintf(stdout, "cold-request-aggregation\tmedian of per-run p50/p95/p99 across %d complete application-cold runs; backend order alternates for every request; gate uses lookup p95\n", *coldRuns)
+		fmt.Fprintln(stdout, "cold-request\tbackend\tready-p50\tready-p95\tlookup-p50\tlookup-p95\tlookup-p99\ttotal-p50\ttotal-p95\ttotal-p99")
+		printColdRequestLatency(stdout, "SQLite", coldRequestResult.sqlite)
+		printColdRequestLatency(stdout, "tinyTiles", coldRequestResult.tiny)
+	}
 	fmt.Fprintln(stdout, "workload\tbackend\treaders\tp50\tp95\tp99")
+	for _, measurement := range coldMeasurements {
+		printLatency(stdout, "fresh-reader-corpus", "SQLite", measurement.readers, measurement.sqlite)
+		printLatency(stdout, "fresh-reader-corpus", "tinyTiles", measurement.readers, measurement.tiny)
+	}
 	printLatency(stdout, "point", "SQLite", 1, sqliteStats)
 	printLatency(stdout, "point", "tinyTiles", 1, tinyStats)
 	for _, parallelism := range []int{4, 8} {
@@ -446,6 +594,22 @@ func commandBenchmark(args []string, stdout, stderr io.Writer) int {
 	}
 	printLatency(stdout, "spatial-2x2", "SQLite", 1, sqliteRangeStats)
 	printLatency(stdout, "spatial-2x2", "tinyTiles", 1, tinyRangeStats)
+	if len(coldFailures) > 0 {
+		for _, failure := range coldFailures {
+			fmt.Fprintf(stderr, "tinytiles benchmark: FAIL cold median-p95 readers=%d %s exceeds %.3fx SQLite %s\n", failure.readers, failure.tiny, *coldMaxP95Ratio, failure.sqlite)
+		}
+		return 1
+	}
+	if coldRequestFailure != nil {
+		fmt.Fprintf(stderr, "tinytiles benchmark: FAIL application-cold lookup median-p95 %s exceeds %.3fx SQLite %s\n", coldRequestFailure.tiny, *coldRequestMaxP95Ratio, coldRequestFailure.sqlite)
+		return 1
+	}
+	if coldEnabled && *coldMaxP95Ratio > 0 {
+		fmt.Fprintf(stdout, "cold-gate\tmedian-p95 <= %.3fx SQLite\tPASS\n", *coldMaxP95Ratio)
+	}
+	if coldRequestResult != nil && *coldRequestMaxP95Ratio > 0 {
+		fmt.Fprintf(stdout, "cold-request-gate\tmedian-lookup-p95 <= %.3fx SQLite\tPASS\n", *coldRequestMaxP95Ratio)
+	}
 	if tinyStats.p95 > 2*sqliteStats.p95 {
 		fmt.Fprintf(stderr, "tinytiles benchmark: FAIL p95 %s exceeds 2x SQLite %s\n", tinyStats.p95, sqliteStats.p95)
 		return 1
@@ -473,12 +637,460 @@ type benchmarkTile struct {
 }
 type latencyStats struct{ p50, p95, p99 time.Duration }
 
+// freshReaderCorpusMeasurement contains the per-percentile median across full
+// runs with freshly opened artifact readers and SQLite connections/statements.
+// It intentionally excludes process startup and OS page-cache eviction,
+// neither of which is a tile-reader operation an application performs for each
+// deployment.
+type freshReaderCorpusMeasurement struct {
+	readers int
+	sqlite  latencyStats
+	tiny    latencyStats
+}
+
+// coldRequestMeasurement records a request path in which no client-side
+// reader or SQLite page cache survives from one coordinate to the next.
+// Artifact validation happens once before timing, matching the publication
+// lifecycle without turning a reader cache into a benchmark cache hit.
+type coldRequestMeasurement struct {
+	sqlite coldRequestStats
+	tiny   coldRequestStats
+}
+
+type coldRequestStats struct {
+	ready  latencyStats
+	lookup latencyStats
+	total  latencyStats
+}
+
+type coldP95Failure struct {
+	readers int
+	sqlite  time.Duration
+	tiny    time.Duration
+}
+
+type coldRequestP95Failure struct {
+	sqlite time.Duration
+	tiny   time.Duration
+}
+
+type benchmarkSQLiteReader struct {
+	db   *sql.DB
+	stmt *sql.Stmt
+}
+
+func openBenchmarkSQLite(source string, readers int) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", "file:"+filepath.Clean(source)+"?mode=ro&immutable=1&cache=private")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(readers)
+	db.SetMaxIdleConns(readers)
+	if err := db.PingContext(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// openBenchmarkSQLiteReaders creates one fully initialized SQLite reader and
+// statement per benchmark worker. Using separate pools avoids accidentally
+// sharing modernc SQLite's per-connection page cache between cold workers.
+func openBenchmarkSQLiteReaders(source, lookupSQL string, readers int) ([]benchmarkSQLiteReader, error) {
+	result := make([]benchmarkSQLiteReader, 0, readers)
+	closeResult := func() {
+		for _, reader := range result {
+			if reader.stmt != nil {
+				_ = reader.stmt.Close()
+			}
+			if reader.db != nil {
+				_ = reader.db.Close()
+			}
+		}
+	}
+	for index := 0; index < readers; index++ {
+		db, err := openBenchmarkSQLite(source, 1)
+		if err != nil {
+			closeResult()
+			return nil, fmt.Errorf("open SQLite reader %d: %w", index+1, err)
+		}
+		stmt, err := db.Prepare(lookupSQL)
+		if err != nil {
+			_ = db.Close()
+			closeResult()
+			return nil, fmt.Errorf("prepare SQLite reader %d: %w", index+1, err)
+		}
+		result = append(result, benchmarkSQLiteReader{db: db, stmt: stmt})
+	}
+	return result, nil
+}
+
+func closeBenchmarkSQLiteReaders(readers []benchmarkSQLiteReader) {
+	for _, reader := range readers {
+		if reader.stmt != nil {
+			_ = reader.stmt.Close()
+		}
+		if reader.db != nil {
+			_ = reader.db.Close()
+		}
+	}
+}
+
+func printColdRequestLatency(writer io.Writer, backend string, stats coldRequestStats) {
+	fmt.Fprintf(writer, "application-cold-request\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", backend, stats.ready.p50, stats.ready.p95, stats.lookup.p50, stats.lookup.p95, stats.lookup.p99, stats.total.p50, stats.total.p95, stats.total.p99)
+}
+
+// measureColdRequests is the strictest in-process reader comparison offered by
+// the CLI. Each coordinate gets a new SQLite connection or one-reader Dataset,
+// so neither backend reuses a client/page cache. This remains
+// application-cold: clearing the host-wide filesystem cache would require a
+// platform-specific privileged operation and is intentionally never hidden in
+// a benchmark command.
+func measureColdRequests(sourcePath, artifactPath string, source sqliteBenchmarkSource, corpus []benchmarkTile, memory int64, runs int) (coldRequestMeasurement, error) {
+	if runs < 1 {
+		return coldRequestMeasurement{}, errors.New("application-cold runs must be positive")
+	}
+	if len(corpus) == 0 {
+		return coldRequestMeasurement{}, errors.New("application-cold corpus must not be empty")
+	}
+	// Validate outside the measured request path. A published artifact is
+	// expected to be verified before it is made live; repeating that full audit
+	// per request would benchmark an invalid deployment lifecycle instead.
+	if _, err := tiles.ValidateArtifact(context.Background(), artifactPath); err != nil {
+		return coldRequestMeasurement{}, fmt.Errorf("validate artifact before application-cold requests: %w", err)
+	}
+	sqliteRuns := make([]coldRequestStats, 0, runs)
+	tinyRuns := make([]coldRequestStats, 0, runs)
+	for run := 0; run < runs; run++ {
+		sqlite, tiny, err := measureColdRequestRun(sourcePath, artifactPath, source, corpus, memory, run)
+		if err != nil {
+			return coldRequestMeasurement{}, fmt.Errorf("run %d/%d: %w", run+1, runs, err)
+		}
+		sqliteRuns = append(sqliteRuns, sqlite)
+		tinyRuns = append(tinyRuns, tiny)
+	}
+	sqlite, err := medianColdRequestStats(sqliteRuns)
+	if err != nil {
+		return coldRequestMeasurement{}, fmt.Errorf("aggregate SQLite: %w", err)
+	}
+	tiny, err := medianColdRequestStats(tinyRuns)
+	if err != nil {
+		return coldRequestMeasurement{}, fmt.Errorf("aggregate tinyTiles: %w", err)
+	}
+	return coldRequestMeasurement{sqlite: sqlite, tiny: tiny}, nil
+}
+
+// measureColdRequestRun alternates the backend per coordinate and shifts that
+// alternation for every run. That prevents a fixed scheduler, file-system, or
+// CPU-state advantage for the backend always measured first.
+func measureColdRequestRun(sourcePath, artifactPath string, source sqliteBenchmarkSource, corpus []benchmarkTile, memory int64, run int) (coldRequestStats, coldRequestStats, error) {
+	sqliteReady := make([]time.Duration, 0, len(corpus))
+	sqliteLookup := make([]time.Duration, 0, len(corpus))
+	sqliteTotal := make([]time.Duration, 0, len(corpus))
+	tinyReady := make([]time.Duration, 0, len(corpus))
+	tinyLookup := make([]time.Duration, 0, len(corpus))
+	tinyTotal := make([]time.Duration, 0, len(corpus))
+	for index, tile := range corpus {
+		measureSQLite := func() error {
+			ready, lookup, total, err := measureColdRequestSQLite(sourcePath, source.lookupSQL, tile)
+			if err != nil {
+				return err
+			}
+			sqliteReady = append(sqliteReady, ready)
+			sqliteLookup = append(sqliteLookup, lookup)
+			sqliteTotal = append(sqliteTotal, total)
+			return nil
+		}
+		measureTiny := func() error {
+			ready, lookup, total, err := measureColdRequestTinyTiles(artifactPath, memory, tile)
+			if err != nil {
+				return err
+			}
+			tinyReady = append(tinyReady, ready)
+			tinyLookup = append(tinyLookup, lookup)
+			tinyTotal = append(tinyTotal, total)
+			return nil
+		}
+		if (run+index)%2 == 0 {
+			if err := measureSQLite(); err != nil {
+				return coldRequestStats{}, coldRequestStats{}, fmt.Errorf("SQLite %d/%d/%d: %w", tile.z, tile.x, tile.y, err)
+			}
+			if err := measureTiny(); err != nil {
+				return coldRequestStats{}, coldRequestStats{}, fmt.Errorf("tinyTiles %d/%d/%d: %w", tile.z, tile.x, tile.y, err)
+			}
+			continue
+		}
+		if err := measureTiny(); err != nil {
+			return coldRequestStats{}, coldRequestStats{}, fmt.Errorf("tinyTiles %d/%d/%d: %w", tile.z, tile.x, tile.y, err)
+		}
+		if err := measureSQLite(); err != nil {
+			return coldRequestStats{}, coldRequestStats{}, fmt.Errorf("SQLite %d/%d/%d: %w", tile.z, tile.x, tile.y, err)
+		}
+	}
+	sqlite, err := coldRequestStatsFromDurations(sqliteReady, sqliteLookup, sqliteTotal)
+	if err != nil {
+		return coldRequestStats{}, coldRequestStats{}, fmt.Errorf("SQLite percentiles: %w", err)
+	}
+	tiny, err := coldRequestStatsFromDurations(tinyReady, tinyLookup, tinyTotal)
+	if err != nil {
+		return coldRequestStats{}, coldRequestStats{}, fmt.Errorf("tinyTiles percentiles: %w", err)
+	}
+	return sqlite, tiny, nil
+}
+
+func measureColdRequestSQLite(sourcePath, lookupSQL string, tile benchmarkTile) (ready, lookup, total time.Duration, err error) {
+	totalStart := time.Now()
+	db, err := openBenchmarkSQLite(sourcePath, 1)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	ready = time.Since(totalStart)
+	lookupStart := time.Now()
+	var data []byte
+	err = db.QueryRowContext(context.Background(), lookupSQL, tile.z, tile.x, tile.y).Scan(&data)
+	lookup = time.Since(lookupStart)
+	total = time.Since(totalStart)
+	closeErr := db.Close()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if closeErr != nil {
+		return 0, 0, 0, closeErr
+	}
+	if len(data) != tile.size {
+		return 0, 0, 0, errors.New("SQLite tile length differs from corpus")
+	}
+	return ready, lookup, total, nil
+}
+
+func measureColdRequestTinyTiles(artifactPath string, memory int64, tile benchmarkTile) (ready, lookup, total time.Duration, err error) {
+	totalStart := time.Now()
+	dataset, err := tinytiles.Open(context.Background(), artifactPath, tinytiles.OpenOptions{Readers: 1, MaxMemoryBytes: memory})
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	ready = time.Since(totalStart)
+	lookupStart := time.Now()
+	value, found, err := dataset.LookupTMS(context.Background(), tiles.Key{Z: tile.z, X: tile.x, Y: tile.y})
+	lookup = time.Since(lookupStart)
+	total = time.Since(totalStart)
+	closeErr := dataset.Close()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if closeErr != nil {
+		return 0, 0, 0, closeErr
+	}
+	if !found || len(value.Data) != tile.size {
+		return 0, 0, 0, errors.New("tinyTiles tile length differs from corpus")
+	}
+	return ready, lookup, total, nil
+}
+
+func coldRequestStatsFromDurations(ready, lookup, total []time.Duration) (coldRequestStats, error) {
+	readyStats, err := latencyStatsFromDurations(ready)
+	if err != nil {
+		return coldRequestStats{}, err
+	}
+	lookupStats, err := latencyStatsFromDurations(lookup)
+	if err != nil {
+		return coldRequestStats{}, err
+	}
+	totalStats, err := latencyStatsFromDurations(total)
+	if err != nil {
+		return coldRequestStats{}, err
+	}
+	return coldRequestStats{ready: readyStats, lookup: lookupStats, total: totalStats}, nil
+}
+
+func medianColdRequestStats(runs []coldRequestStats) (coldRequestStats, error) {
+	if len(runs) == 0 {
+		return coldRequestStats{}, errors.New("no application-cold runs to aggregate")
+	}
+	ready := make([]latencyStats, 0, len(runs))
+	lookup := make([]latencyStats, 0, len(runs))
+	total := make([]latencyStats, 0, len(runs))
+	for _, run := range runs {
+		ready = append(ready, run.ready)
+		lookup = append(lookup, run.lookup)
+		total = append(total, run.total)
+	}
+	readyMedian, err := medianLatencyStats(ready)
+	if err != nil {
+		return coldRequestStats{}, err
+	}
+	lookupMedian, err := medianLatencyStats(lookup)
+	if err != nil {
+		return coldRequestStats{}, err
+	}
+	totalMedian, err := medianLatencyStats(total)
+	if err != nil {
+		return coldRequestStats{}, err
+	}
+	return coldRequestStats{ready: readyMedian, lookup: lookupMedian, total: totalMedian}, nil
+}
+
+func benchmarkReaderCounts(limit int) []int {
+	counts := []int{1}
+	for _, readers := range []int{4, 8} {
+		if readers <= limit {
+			counts = append(counts, readers)
+		}
+	}
+	return counts
+}
+
+// measureFreshReaderCorpus repeats every complete reader profile without
+// changing the randomized, unique corpus. Each run gets new Dataset readers
+// and new SQLite connections/statements, and the result is the median p50,
+// p95 and p99 across those complete runs. This prevents a one-off scheduling
+// outlier from deciding the cold p95 gate without removing any slow tiles.
+//
+// It is deliberately called after corpus selection and before sample parity,
+// complete parity, or warm-up reads.
+func measureFreshReaderCorpus(sourcePath, artifactPath string, source sqliteBenchmarkSource, corpus []benchmarkTile, memory int64, readerCounts []int, runs int) ([]freshReaderCorpusMeasurement, error) {
+	if runs < 1 {
+		return nil, errors.New("fresh-reader corpus runs must be positive")
+	}
+	measurements := make([]freshReaderCorpusMeasurement, 0, len(readerCounts))
+	for _, readers := range readerCounts {
+		sqliteRuns := make([]latencyStats, 0, runs)
+		tinyRuns := make([]latencyStats, 0, runs)
+		for run := 0; run < runs; run++ {
+			sqliteStats, tinyStats, err := measureFreshReaderCorpusRun(sourcePath, artifactPath, source, corpus, memory, readers, run%2 == 0)
+			if err != nil {
+				return nil, fmt.Errorf("run %d/%d readers=%d: %w", run+1, runs, readers, err)
+			}
+			sqliteRuns = append(sqliteRuns, sqliteStats)
+			tinyRuns = append(tinyRuns, tinyStats)
+		}
+		sqliteMedian, err := medianLatencyStats(sqliteRuns)
+		if err != nil {
+			return nil, fmt.Errorf("aggregate SQLite readers=%d: %w", readers, err)
+		}
+		tinyMedian, err := medianLatencyStats(tinyRuns)
+		if err != nil {
+			return nil, fmt.Errorf("aggregate artifact readers=%d: %w", readers, err)
+		}
+		measurements = append(measurements, freshReaderCorpusMeasurement{readers: readers, sqlite: sqliteMedian, tiny: tinyMedian})
+	}
+	return measurements, nil
+}
+
+// measureFreshReaderCorpusRun executes one complete profile using only fresh
+// logical readers. It keeps the source corpus fixed so aggregation cannot
+// suppress a slow coordinate by selecting a different sample. Successive
+// profiles alternate the backend measurement order to avoid a fixed first or
+// second position bias from filesystem activity.
+func measureFreshReaderCorpusRun(sourcePath, artifactPath string, source sqliteBenchmarkSource, corpus []benchmarkTile, memory int64, readers int, sqliteFirst bool) (latencyStats, latencyStats, error) {
+	sqliteReaders, err := openBenchmarkSQLiteReaders(sourcePath, source.lookupSQL, readers)
+	if err != nil {
+		return latencyStats{}, latencyStats{}, err
+	}
+	defer closeBenchmarkSQLiteReaders(sqliteReaders)
+	dataset, err := tinytiles.Open(context.Background(), artifactPath, tinytiles.OpenOptions{Readers: readers, MaxMemoryBytes: memory})
+	if err != nil {
+		return latencyStats{}, latencyStats{}, fmt.Errorf("open artifact readers=%d: %w", readers, err)
+	}
+	datasetOpen := true
+	defer func() {
+		if datasetOpen {
+			_ = dataset.Close()
+		}
+	}()
+
+	sqliteLookup := func(reader int, tile benchmarkTile) error {
+		var data []byte
+		if err := sqliteReaders[reader].stmt.QueryRowContext(context.Background(), tile.z, tile.x, tile.y).Scan(&data); err != nil {
+			return err
+		}
+		if len(data) != tile.size {
+			return errors.New("SQLite tile length differs from corpus")
+		}
+		return nil
+	}
+	tinyLookup := func(_ int, tile benchmarkTile) error {
+		value, found, err := dataset.LookupTMS(context.Background(), tiles.Key{Z: tile.z, X: tile.x, Y: tile.y})
+		if err != nil {
+			return err
+		}
+		if !found || len(value.Data) != tile.size {
+			return errors.New("tinyTiles tile length differs from corpus")
+		}
+		return nil
+	}
+	var sqliteStats, tinyStats latencyStats
+	if sqliteFirst {
+		sqliteStats, err = measureParallelByReader(corpus, readers, sqliteLookup)
+		if err != nil {
+			return latencyStats{}, latencyStats{}, fmt.Errorf("SQLite readers=%d: %w", readers, err)
+		}
+		tinyStats, err = measureParallelByReader(corpus, readers, tinyLookup)
+		if err != nil {
+			return latencyStats{}, latencyStats{}, fmt.Errorf("artifact readers=%d: %w", readers, err)
+		}
+	} else {
+		tinyStats, err = measureParallelByReader(corpus, readers, tinyLookup)
+		if err != nil {
+			return latencyStats{}, latencyStats{}, fmt.Errorf("artifact readers=%d: %w", readers, err)
+		}
+		sqliteStats, err = measureParallelByReader(corpus, readers, sqliteLookup)
+		if err != nil {
+			return latencyStats{}, latencyStats{}, fmt.Errorf("SQLite readers=%d: %w", readers, err)
+		}
+	}
+	if err := dataset.Close(); err != nil {
+		return latencyStats{}, latencyStats{}, fmt.Errorf("close artifact readers=%d: %w", readers, err)
+	}
+	datasetOpen = false
+	return sqliteStats, tinyStats, nil
+}
+
+// medianLatencyStats aggregates each percentile independently. This is the
+// statistic reported by --cold-runs and used by the cold p95 gate.
+func medianLatencyStats(runs []latencyStats) (latencyStats, error) {
+	if len(runs) == 0 {
+		return latencyStats{}, errors.New("no latency runs to aggregate")
+	}
+	p50 := make([]time.Duration, 0, len(runs))
+	p95 := make([]time.Duration, 0, len(runs))
+	p99 := make([]time.Duration, 0, len(runs))
+	for _, run := range runs {
+		p50 = append(p50, run.p50)
+		p95 = append(p95, run.p95)
+		p99 = append(p99, run.p99)
+	}
+	return latencyStats{p50: medianDuration(p50), p95: medianDuration(p95), p99: medianDuration(p99)}, nil
+}
+
+func medianDuration(values []time.Duration) time.Duration {
+	sorted := append([]time.Duration(nil), values...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	middle := len(sorted) / 2
+	if len(sorted)%2 != 0 {
+		return sorted[middle]
+	}
+	return sorted[middle-1] + (sorted[middle]-sorted[middle-1])/2
+}
+
+func coldP95Failures(measurements []freshReaderCorpusMeasurement, ratio float64) []coldP95Failure {
+	var failures []coldP95Failure
+	for _, measurement := range measurements {
+		if float64(measurement.tiny.p95) > float64(measurement.sqlite.p95)*ratio {
+			failures = append(failures, coldP95Failure{readers: measurement.readers, sqlite: measurement.sqlite.p95, tiny: measurement.tiny.p95})
+		}
+	}
+	return failures
+}
+
 type sqliteBenchmarkSource struct {
-	zoomLevelsSQL  string
-	tilesAtZoomSQL string
-	lookupSQL      string
-	rangeSQL       string
-	fullTilesSQL   string
+	schema             tiles.Schema
+	zoomLevelsSQL      string
+	tileCountAtZoomSQL string
+	tilesAtZoomSQL     string
+	lookupSQL          string
+	rangeSQL           string
+	fullTilesSQL       string
 }
 
 func detectBenchmarkSource(db *sql.DB) (sqliteBenchmarkSource, error) {
@@ -488,11 +1100,13 @@ func detectBenchmarkSource(db *sql.DB) (sqliteBenchmarkSource, error) {
 	}
 	if flat {
 		return sqliteBenchmarkSource{
-			zoomLevelsSQL:  `SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level`,
-			tilesAtZoomSQL: `SELECT zoom_level,tile_column,tile_row,length(tile_data) FROM tiles WHERE zoom_level=? ORDER BY tile_column,tile_row LIMIT ?`,
-			lookupSQL:      `SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?`,
-			rangeSQL:       `SELECT zoom_level,tile_column,tile_row,tile_data FROM tiles WHERE zoom_level=? AND tile_column BETWEEN ? AND ? AND tile_row BETWEEN ? AND ?`,
-			fullTilesSQL:   `SELECT zoom_level,tile_column,tile_row,tile_data FROM tiles ORDER BY zoom_level,tile_column,tile_row`,
+			schema:             tiles.SchemaFlat,
+			zoomLevelsSQL:      `SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level`,
+			tileCountAtZoomSQL: `SELECT COUNT(*) FROM tiles WHERE zoom_level=?`,
+			tilesAtZoomSQL:     `SELECT zoom_level,tile_column,tile_row,length(tile_data) FROM tiles WHERE zoom_level=? ORDER BY tile_column,tile_row`,
+			lookupSQL:          `SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?`,
+			rangeSQL:           `SELECT zoom_level,tile_column,tile_row,tile_data FROM tiles WHERE zoom_level=? AND tile_column BETWEEN ? AND ? AND tile_row BETWEEN ? AND ?`,
+			fullTilesSQL:       `SELECT zoom_level,tile_column,tile_row,tile_data FROM tiles ORDER BY zoom_level,tile_column,tile_row`,
 		}, nil
 	}
 	mapTable, err := sqliteTableExists(db, "map")
@@ -505,11 +1119,13 @@ func detectBenchmarkSource(db *sql.DB) (sqliteBenchmarkSource, error) {
 	}
 	if mapTable && images {
 		return sqliteBenchmarkSource{
-			zoomLevelsSQL:  `SELECT DISTINCT zoom_level FROM map ORDER BY zoom_level`,
-			tilesAtZoomSQL: `SELECT m.zoom_level,m.tile_column,m.tile_row,length(i.tile_data) FROM map AS m JOIN images AS i ON i.tile_id=m.tile_id WHERE m.zoom_level=? ORDER BY m.tile_column,m.tile_row LIMIT ?`,
-			lookupSQL:      `SELECT i.tile_data FROM map AS m JOIN images AS i ON i.tile_id=m.tile_id WHERE m.zoom_level=? AND m.tile_column=? AND m.tile_row=?`,
-			rangeSQL:       `SELECT m.zoom_level,m.tile_column,m.tile_row,i.tile_data FROM map AS m JOIN images AS i ON i.tile_id=m.tile_id WHERE m.zoom_level=? AND m.tile_column BETWEEN ? AND ? AND m.tile_row BETWEEN ? AND ?`,
-			fullTilesSQL:   `SELECT m.zoom_level,m.tile_column,m.tile_row,i.tile_data FROM map AS m JOIN images AS i ON i.tile_id=m.tile_id ORDER BY m.zoom_level,m.tile_column,m.tile_row`,
+			schema:             tiles.SchemaNormalized,
+			zoomLevelsSQL:      `SELECT DISTINCT zoom_level FROM map ORDER BY zoom_level`,
+			tileCountAtZoomSQL: `SELECT COUNT(*) FROM map WHERE zoom_level=?`,
+			tilesAtZoomSQL:     `SELECT m.zoom_level,m.tile_column,m.tile_row,length(i.tile_data) FROM map AS m JOIN images AS i ON i.tile_id=m.tile_id WHERE m.zoom_level=? ORDER BY m.tile_column,m.tile_row`,
+			lookupSQL:          `SELECT i.tile_data FROM map AS m JOIN images AS i ON i.tile_id=m.tile_id WHERE m.zoom_level=? AND m.tile_column=? AND m.tile_row=?`,
+			rangeSQL:           `SELECT m.zoom_level,m.tile_column,m.tile_row,i.tile_data FROM map AS m JOIN images AS i ON i.tile_id=m.tile_id WHERE m.zoom_level=? AND m.tile_column BETWEEN ? AND ? AND m.tile_row BETWEEN ? AND ?`,
+			fullTilesSQL:       `SELECT m.zoom_level,m.tile_column,m.tile_row,i.tile_data FROM map AS m JOIN images AS i ON i.tile_id=m.tile_id ORDER BY m.zoom_level,m.tile_column,m.tile_row`,
 		}, nil
 	}
 	return sqliteBenchmarkSource{}, errors.New("source has neither flat tiles nor normalized map/images schema")
@@ -527,7 +1143,12 @@ func sqliteTableExists(db *sql.DB, table string) (bool, error) {
 	return true, nil
 }
 
-func benchmarkCorpus(db *sql.DB, source sqliteBenchmarkSource, count int) ([]benchmarkTile, error) {
+// benchmarkCorpus makes a reproducible, zoom-stratified corpus. It samples
+// uniformly within each zoom and redistributes unused quota from sparse zooms,
+// rather than taking the first coordinates at every zoom. That keeps a
+// requested 512-request run at 512 requests whenever the source contains at
+// least 512 tiles, including regional sources with a very sparse low zoom.
+func benchmarkCorpus(db *sql.DB, source sqliteBenchmarkSource, count int, seed int64) ([]benchmarkTile, error) {
 	levels, err := db.Query(source.zoomLevelsSQL)
 	if err != nil {
 		return nil, err
@@ -547,33 +1168,137 @@ func benchmarkCorpus(db *sql.DB, source sqliteBenchmarkSource, count int) ([]ben
 	if len(zooms) == 0 {
 		return nil, errors.New("source has no tiles")
 	}
-	perZoom := (count + len(zooms) - 1) / len(zooms)
-	corpus := make([]benchmarkTile, 0, perZoom*len(zooms))
-	for _, z := range zooms {
-		rows, err := db.Query(source.tilesAtZoomSQL, z, perZoom)
+	available := make([]int, len(zooms))
+	totalAvailable := 0
+	for index, z := range zooms {
+		var tileCount int
+		if err := db.QueryRow(source.tileCountAtZoomSQL, z).Scan(&tileCount); err != nil {
+			return nil, fmt.Errorf("count source tiles at zoom %d: %w", z, err)
+		}
+		if tileCount < 0 {
+			return nil, fmt.Errorf("source has invalid negative tile count at zoom %d", z)
+		}
+		available[index] = tileCount
+		totalAvailable += tileCount
+	}
+	if totalAvailable == 0 {
+		return nil, errors.New("source has no readable tiles")
+	}
+	target := min(count, totalAvailable)
+	quotas := benchmarkZoomQuotas(available, target)
+	corpus := make([]benchmarkTile, 0, target)
+	rng := rand.New(rand.NewSource(seed ^ 0x6A09E667F3BCC909))
+	for index, z := range zooms {
+		if quotas[index] == 0 {
+			continue
+		}
+		rows, err := db.Query(source.tilesAtZoomSQL, z)
 		if err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			var tile benchmarkTile
-			if err := rows.Scan(&tile.z, &tile.x, &tile.y, &tile.size); err != nil {
-				_ = rows.Close()
-				return nil, err
-			}
-			corpus = append(corpus, tile)
+		tilesAtZoom, err := reservoirBenchmarkTiles(rows, quotas[index], rng)
+		if err != nil {
+			return nil, fmt.Errorf("sample source tiles at zoom %d: %w", z, err)
 		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		if err := rows.Close(); err != nil {
-			return nil, err
-		}
+		corpus = append(corpus, tilesAtZoom...)
 	}
-	if len(corpus) == 0 {
-		return nil, errors.New("source has no readable tiles")
+	if len(corpus) != target {
+		return nil, fmt.Errorf("sampled %d tiles, want %d", len(corpus), target)
 	}
 	return corpus, nil
+}
+
+// benchmarkZoomQuotas assigns an equal share to every available zoom first,
+// then cycles through zooms with spare coordinates until the request budget is
+// full. The difference between non-exhausted zoom quotas is at most one.
+func benchmarkZoomQuotas(available []int, target int) []int {
+	quotas := make([]int, len(available))
+	remaining := target
+	for remaining > 0 {
+		progressed := false
+		for index, count := range available {
+			if quotas[index] >= count {
+				continue
+			}
+			quotas[index]++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+	return quotas
+}
+
+// reservoirBenchmarkTiles samples a zoom without retaining every coordinate
+// in memory. SQL's ordering makes the stream reproducible, while reservoir
+// sampling avoids a spatially biased first-N slice.
+func reservoirBenchmarkTiles(rows *sql.Rows, limit int, rng *rand.Rand) ([]benchmarkTile, error) {
+	defer rows.Close()
+	if limit < 1 {
+		return nil, errors.New("reservoir limit must be positive")
+	}
+	selected := make([]benchmarkTile, 0, limit)
+	seen := 0
+	for rows.Next() {
+		var tile benchmarkTile
+		if err := rows.Scan(&tile.z, &tile.x, &tile.y, &tile.size); err != nil {
+			return nil, err
+		}
+		if tile.size < 0 {
+			return nil, fmt.Errorf("negative tile size at %d/%d/%d", tile.z, tile.x, tile.y)
+		}
+		seen++
+		if len(selected) < limit {
+			selected = append(selected, tile)
+			continue
+		}
+		if replacement := rng.Intn(seen); replacement < limit {
+			selected[replacement] = tile
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(selected) != limit {
+		return nil, fmt.Errorf("sampled %d tiles from %d available rows, want %d", len(selected), seen, limit)
+	}
+	return selected, nil
+}
+
+// randomizeUniqueBenchmarkCorpus makes request order reproducible without
+// allowing duplicate coordinate lookups to turn a reader-cache hit into a
+// misleading "cold" sample. Duplicate MBTiles coordinate keys are invalid for
+// this benchmark, so report them instead of silently changing the workload.
+func randomizeUniqueBenchmarkCorpus(corpus []benchmarkTile, seed int64) error {
+	seen := make(map[[3]int]struct{}, len(corpus))
+	for _, tile := range corpus {
+		key := [3]int{tile.z, tile.x, tile.y}
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("benchmark corpus contains duplicate tile key %d/%d/%d", tile.z, tile.x, tile.y)
+		}
+		seen[key] = struct{}{}
+	}
+	rng := rand.New(rand.NewSource(seed))
+	rng.Shuffle(len(corpus), func(i, j int) { corpus[i], corpus[j] = corpus[j], corpus[i] })
+	return nil
+}
+
+func latencyStatsFromDurations(values []time.Duration) (latencyStats, error) {
+	if len(values) == 0 {
+		return latencyStats{}, errors.New("latency sample must not be empty")
+	}
+	ordered := append([]time.Duration(nil), values...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	return latencyStats{
+		p50: ordered[(len(ordered)-1)*50/100],
+		p95: ordered[(len(ordered)-1)*95/100],
+		p99: ordered[(len(ordered)-1)*99/100],
+	}, nil
 }
 
 func warm(corpus []benchmarkTile, lookup func(benchmarkTile) error) error {
@@ -593,8 +1318,7 @@ func measure(corpus []benchmarkTile, lookup func(benchmarkTile) error) (latencyS
 		}
 		latencies = append(latencies, time.Since(start))
 	}
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	return latencyStats{latencies[(len(latencies)-1)*50/100], latencies[(len(latencies)-1)*95/100], latencies[(len(latencies)-1)*99/100]}, nil
+	return latencyStatsFromDurations(latencies)
 }
 
 func measureParallel(corpus []benchmarkTile, workers int, lookup func(benchmarkTile) error) (latencyStats, error) {
@@ -636,8 +1360,50 @@ func measureParallel(corpus []benchmarkTile, workers int, lookup func(benchmarkT
 	if firstErr != nil {
 		return latencyStats{}, firstErr
 	}
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	return latencyStats{latencies[(len(latencies)-1)*50/100], latencies[(len(latencies)-1)*95/100], latencies[(len(latencies)-1)*99/100]}, nil
+	return latencyStatsFromDurations(latencies)
+}
+
+// measureParallelByReader pins a worker to its supplied reader index. This is
+// useful for cold measurements: every worker receives a separate fresh SQLite
+// page cache and statement, while the Dataset keeps the same independent-reader
+// pool shape that it uses in production.
+func measureParallelByReader(corpus []benchmarkTile, workers int, lookup func(reader int, tile benchmarkTile) error) (latencyStats, error) {
+	if workers < 1 {
+		return latencyStats{}, errors.New("parallel worker count must be positive")
+	}
+	if len(corpus) == 0 {
+		return latencyStats{}, errors.New("parallel benchmark corpus must not be empty")
+	}
+	latencies := make([]time.Duration, len(corpus))
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+	start := make(chan struct{})
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(reader int) {
+			defer wg.Done()
+			<-start
+			for index := reader; index < len(corpus); index += workers {
+				start := time.Now()
+				if err := lookup(reader, corpus[index]); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					continue
+				}
+				latencies[index] = time.Since(start)
+			}
+		}(worker)
+	}
+	close(start)
+	wg.Wait()
+	if firstErr != nil {
+		return latencyStats{}, firstErr
+	}
+	return latencyStatsFromDurations(latencies)
 }
 
 func verifyBenchmarkParity(corpus []benchmarkTile, stmt *sql.Stmt, dataset *tinytiles.Dataset) error {

@@ -55,8 +55,12 @@ type Dataset struct {
 	artifactPath string
 	info         tiles.ArtifactInfo
 	metadata     map[string]string
-	readers      chan tiles.Reader
-	done         chan struct{}
+	// hotReader keeps the most recently released reader available for the next
+	// request. A sequential request stream then keeps using one pager cache
+	// instead of round-robining through every reader in the pool.
+	hotReader chan tiles.Reader
+	readers   chan tiles.Reader
+	done      chan struct{}
 
 	mu       sync.RWMutex
 	closed   bool
@@ -100,7 +104,8 @@ func Open(ctx context.Context, artifactPath string, options OpenOptions) (*Datas
 		artifactPath: artifactPath,
 		info:         first.Info(),
 		metadata:     make(map[string]string),
-		readers:      make(chan tiles.Reader, readerCount),
+		hotReader:    make(chan tiles.Reader, 1),
+		readers:      make(chan tiles.Reader, readerCount-1),
 		done:         make(chan struct{}),
 	}
 	if err := first.ScanMetadata(ctx, func(name, value string) error {
@@ -113,7 +118,7 @@ func Open(ctx context.Context, artifactPath string, options OpenOptions) (*Datas
 		_ = first.Close()
 		return nil, fmt.Errorf("tinytiles: read artifact metadata: %w", err)
 	}
-	dataset.readers <- first
+	dataset.hotReader <- first
 	for index := 1; index < readerCount; index++ {
 		reader, err := tiles.OpenArtifact(ctx, artifactPath, tiles.OpenOptions{MaxMemoryBytes: options.MaxMemoryBytes})
 		if err != nil {
@@ -257,6 +262,10 @@ func (d *Dataset) Close() error {
 	var closeErr error
 	for {
 		select {
+		case reader := <-d.hotReader:
+			if err := reader.Close(); err != nil {
+				closeErr = errors.Join(closeErr, err)
+			}
 		case reader := <-d.readers:
 			if err := reader.Close(); err != nil {
 				closeErr = errors.Join(closeErr, err)
@@ -274,17 +283,19 @@ func (d *Dataset) acquire(ctx context.Context) (tiles.Reader, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Prefer the reader most recently returned to the pool. The non-blocking
+	// check is intentional: a select over both channels would randomize when
+	// idle readers exist in the secondary pool and would defeat cache affinity.
 	select {
+	case reader := <-d.hotReader:
+		return d.borrow(reader)
+	default:
+	}
+	select {
+	case reader := <-d.hotReader:
+		return d.borrow(reader)
 	case reader := <-d.readers:
-		d.mu.RLock()
-		if d.closed {
-			d.mu.RUnlock()
-			_ = reader.Close()
-			return nil, ErrClosed
-		}
-		d.inFlight.Add(1)
-		d.mu.RUnlock()
-		return reader, nil
+		return d.borrow(reader)
 	case <-d.done:
 		return nil, ErrClosed
 	case <-ctx.Done():
@@ -292,18 +303,34 @@ func (d *Dataset) acquire(ctx context.Context) (tiles.Reader, error) {
 	}
 }
 
+func (d *Dataset) borrow(reader tiles.Reader) (tiles.Reader, error) {
+	d.mu.RLock()
+	if d.closed {
+		d.mu.RUnlock()
+		_ = reader.Close()
+		return nil, ErrClosed
+	}
+	d.inFlight.Add(1)
+	d.mu.RUnlock()
+	return reader, nil
+}
+
 func (d *Dataset) release(reader tiles.Reader) {
 	if d == nil || reader == nil {
 		return
 	}
-	d.mu.RLock()
-	closed := d.closed
-	if !closed {
+	// The pool itself is never closed. Return the reader before decreasing the
+	// in-flight count so Close cannot finish its WaitGroup and drain the pool
+	// before this reader is available to close. acquire has already registered
+	// this lookup while holding mu's read lock, which keeps that registration
+	// ordered before Close starts waiting. Prefer the one-slot hot lane so
+	// sequential requests retain a useful page cache; all other readers remain
+	// available in the secondary pool. Avoiding a second read lock here keeps
+	// the normal lookup return path lean.
+	select {
+	case d.hotReader <- reader:
+	default:
 		d.readers <- reader
-	}
-	d.mu.RUnlock()
-	if closed {
-		_ = reader.Close()
 	}
 	d.inFlight.Done()
 }

@@ -2,8 +2,10 @@ package offline
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestMemoryStoreCopiesTilePayloadsAndDeletesRevision(t *testing.T) {
@@ -65,3 +67,80 @@ func TestMemoryStoreConcurrentAccess(t *testing.T) {
 	}
 	group.Wait()
 }
+
+type wrappedMemoryStore struct{ *MemoryStore }
+
+func TestSyncFastPathUsesOnlyExactMemoryStore(t *testing.T) {
+	store := NewMemoryStore()
+	if newSyncStoreFastPath(store, "demo", "r1") == nil {
+		t.Fatal("MemoryStore did not select its verified fast path")
+	}
+	if newSyncStoreFastPath(&wrappedMemoryStore{MemoryStore: store}, "demo", "r1") != nil {
+		t.Fatal("MemoryStore wrapper bypassed its Store implementation")
+	}
+}
+
+func TestMemoryStoreVerifiedEntriesArePrivateAndWarm(t *testing.T) {
+	store := NewMemoryStore()
+	manifest := testManifest("verified")
+	key := TileKey{Z: 1, X: 0, Y: 0}
+	tile := checkedTile([]byte("verified payload"))
+	if err := store.putVerifiedTile(context.Background(), manifest.Dataset, manifest.Revision, key, tile); err != nil {
+		t.Fatal(err)
+	}
+	tile.Data[0] = 'V'
+	got, found, err := store.getVerifiedTile(context.Background(), manifest.Dataset, manifest.Revision, key)
+	if err != nil || !found || string(got.Data) != "verified payload" {
+		t.Fatalf("verified tile=%q found=%t err=%v", got.Data, found, err)
+	}
+	all, err := store.hasVerifiedTiles(context.Background(), manifest.Dataset, manifest.Revision, SyncRequest{Keys: []TileKey{key}})
+	if err != nil || !all {
+		t.Fatalf("verified warm cache all=%t err=%v", all, err)
+	}
+}
+
+func TestMemoryStoreWarmScanDoesNotTrustPublicChecksummedTiles(t *testing.T) {
+	store := NewMemoryStore()
+	manifest := testManifest("untrusted")
+	key := TileKey{Z: 1, X: 0, Y: 0}
+	if err := store.PutTile(context.Background(), manifest.Dataset, manifest.Revision, key, checkedTile([]byte("public payload"))); err != nil {
+		t.Fatal(err)
+	}
+	all, err := store.hasVerifiedTiles(context.Background(), manifest.Dataset, manifest.Revision, SyncRequest{Keys: []TileKey{key}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all {
+		t.Fatal("public checksummed tile bypassed synchronization verification")
+	}
+}
+
+func TestMemoryStoreWarmScanHonorsCancellation(t *testing.T) {
+	store := NewMemoryStore()
+	manifest := testManifest("canceled")
+	keys := []TileKey{{Z: 2, X: 0, Y: 0}, {Z: 2, X: 1, Y: 0}}
+	for _, key := range keys {
+		if err := store.putVerifiedTile(context.Background(), manifest.Dataset, manifest.Revision, key, checkedTile([]byte(key.String()))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all, err := store.hasVerifiedTiles(&cancelAfterContext{remaining: 2}, manifest.Dataset, manifest.Revision, SyncRequest{Keys: keys})
+	if all || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled warm scan all=%t err=%v", all, err)
+	}
+}
+
+// cancelAfterContext is deterministic test scaffolding for a cancellation
+// between tiles, without relying on a timer racing a short in-memory scan.
+type cancelAfterContext struct{ remaining int }
+
+func (c *cancelAfterContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *cancelAfterContext) Done() <-chan struct{}       { return nil }
+func (c *cancelAfterContext) Err() error {
+	if c.remaining == 0 {
+		return context.Canceled
+	}
+	c.remaining--
+	return nil
+}
+func (c *cancelAfterContext) Value(any) any { return nil }

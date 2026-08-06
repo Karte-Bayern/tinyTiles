@@ -151,17 +151,51 @@ func (m Manifest) TileURL(key TileKey) (string, error) {
 	if err := key.Validate(); err != nil {
 		return "", err
 	}
-	resolved := m.TileURLTemplate
-	replacements := map[string]string{
-		"{revision}": url.PathEscape(m.Revision),
-		"{z}":        strconv.Itoa(key.Z),
-		"{x}":        strconv.Itoa(key.X),
-		"{y}":        strconv.Itoa(key.Y),
+	return renderTileURL(m.TileURLTemplate, m.Revision, key), nil
+}
+
+// renderTileURL substitutes the four supported placeholders in one pass. Its
+// callers have already validated the template and coordinates. Keeping this
+// allocation-conscious helper separate lets the synchronizer reuse a
+// prevalidated manifest rather than parsing and validating it for every tile.
+func renderTileURL(template, revision string, key TileKey) string {
+	escapedRevision := url.PathEscape(revision)
+	var zBuffer, xBuffer, yBuffer [20]byte
+	z := strconv.AppendInt(zBuffer[:0], int64(key.Z), 10)
+	x := strconv.AppendInt(xBuffer[:0], int64(key.X), 10)
+	y := strconv.AppendInt(yBuffer[:0], int64(key.Y), 10)
+
+	var builder strings.Builder
+	// A normal template contains every coordinate placeholder once. This is a
+	// lower bound only, but it avoids growth for the overwhelmingly common
+	// case while preserving support for repeated placeholders.
+	builder.Grow(len(template) + len(escapedRevision) + len(z) + len(x) + len(y))
+	for {
+		start := strings.IndexByte(template, '{')
+		if start < 0 {
+			builder.WriteString(template)
+			return builder.String()
+		}
+		builder.WriteString(template[:start])
+		template = template[start:]
+		switch {
+		case strings.HasPrefix(template, "{revision}"):
+			builder.WriteString(escapedRevision)
+			template = template[len("{revision}"):]
+		case strings.HasPrefix(template, "{z}"):
+			builder.Write(z)
+			template = template[len("{z}"):]
+		case strings.HasPrefix(template, "{x}"):
+			builder.Write(x)
+			template = template[len("{x}"):]
+		case strings.HasPrefix(template, "{y}"):
+			builder.Write(y)
+			template = template[len("{y}"):]
+		default:
+			builder.WriteByte('{')
+			template = template[1:]
+		}
 	}
-	for placeholder, value := range replacements {
-		resolved = strings.ReplaceAll(resolved, placeholder, value)
-	}
-	return resolved, nil
 }
 
 // Tile contains one immutable tile response. Checksum, when provided, is a

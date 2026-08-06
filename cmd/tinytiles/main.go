@@ -18,6 +18,7 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -29,13 +30,33 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const (
+	defaultImportBatchSize = 1_000
+	// defaultAutoImportBatchSize is large enough to amortize paged-index
+	// checkpoints without making one cancellation boundary excessively long.
+	// The actual automatic value is further capped by a bounded source sample
+	// and the caller's memory limit before the importer is started.
+	defaultAutoImportBatchSize       = 8_192
+	importBatchSampleRows            = 1_024
+	importBatchSampleHeadroom        = 8
+	importBatchMinimumTileSize int64 = 16 << 10
+
+	// tinySQL's artifact importer reserves a fixed streaming buffer plus this
+	// per-row bookkeeping when it performs its preflight memory gate. Keep the
+	// automatic CLI batch conservatively within that bounded model; the
+	// importer remains the authoritative final preflight check.
+	importBatchFixedMemory    int64 = 2 << 20
+	importBatchPerRowOverhead int64 = 768
+)
+
 func commandImport(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	batch := fs.Int("batch", 1_000, "rows per bounded import batch")
+	batch := fs.Int("batch", defaultImportBatchSize, "rows per bounded import batch; 0 enables automatic tuning within the memory limit")
 	memory := fs.Int64("max-memory", 64<<20, "maximum tinySQL cache budget in bytes")
 	reserve := fs.Int64("min-free", 1<<30, "required free disk reserve in bytes")
 	schema := fs.String("schema", "auto", "artifact schema: auto, flat, normalized")
+	compact := fs.Bool("compact", false, "losslessly deduplicate equal tile payloads into a normalized artifact (uses temporary disk)")
 	replace := fs.Bool("replace", false, "atomically replace an existing artifact")
 	if fs.Parse(args) != nil || fs.NArg() != 2 {
 		fmt.Fprintln(stderr, "usage: tinytiles import [flags] source.mbtiles dataset.ttiles/")
@@ -46,7 +67,21 @@ func commandImport(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	result, err := importArtifact(context.Background(), fs.Arg(0), fs.Arg(1), artifactSchema, *batch, *memory, *reserve, *replace, stdout)
+	if *compact && artifactSchema == tiles.SchemaFlat {
+		fmt.Fprintln(stderr, "tinytiles import: --compact requires schema auto or normalized; schema flat would discard payload deduplication")
+		return 2
+	}
+	if *batch < 0 || *memory <= 0 || *reserve < 0 {
+		fmt.Fprintln(stderr, "tinytiles import: batch must be zero (automatic) or positive; max-memory must be positive; min-free must not be negative")
+		return 2
+	}
+	if err := validateImportPaths(fs.Arg(0), fs.Arg(1)); err != nil {
+		fmt.Fprintf(stderr, "tinytiles import: %v\n", err)
+		return 2
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+	result, err := importArtifactWithProvenanceAndCompact(ctx, fs.Arg(0), fs.Arg(1), artifactSchema, *batch, *memory, *reserve, *replace, nil, *compact, stdout)
 	if err != nil {
 		fmt.Fprintf(stderr, "tinytiles import: %v\n", err)
 		return 1
@@ -55,13 +90,81 @@ func commandImport(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// validateImportPaths prevents --replace from turning the input MBTiles file
+// into the artifact directory. samePath catches ordinary and symlink aliases;
+// os.SameFile additionally catches hard links on filesystems that support them.
+func validateImportPaths(source, artifact string) error {
+	if err := requireRegularFile("MBTiles source", source); err != nil {
+		return err
+	}
+	same, err := samePath(source, artifact)
+	if err != nil {
+		return fmt.Errorf("resolve source and artifact paths: %w", err)
+	}
+	if same {
+		return fmt.Errorf("artifact path %q must not refer to MBTiles source %q", artifact, source)
+	}
+	sourceInfo, err := os.Stat(source)
+	if err != nil {
+		return fmt.Errorf("stat MBTiles source %q: %w", source, err)
+	}
+	artifactInfo, err := os.Stat(artifact)
+	if err == nil && os.SameFile(sourceInfo, artifactInfo) {
+		return fmt.Errorf("artifact path %q must not refer to MBTiles source %q", artifact, source)
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat artifact path %q: %w", artifact, err)
+	}
+	if within, err := pathWithin(source, artifact); err != nil {
+		return fmt.Errorf("resolve source and artifact paths: %w", err)
+	} else if within {
+		return fmt.Errorf("artifact path %q must not contain MBTiles source %q", artifact, source)
+	}
+	if within, err := pathWithin(artifact, source); err != nil {
+		return fmt.Errorf("resolve source and artifact paths: %w", err)
+	} else if within {
+		return fmt.Errorf("artifact path %q must not be inside MBTiles source %q", artifact, source)
+	}
+	return nil
+}
+
 func importArtifact(ctx context.Context, source, artifact string, schema tiles.Schema, batch int, memory, reserve int64, replace bool, stdout io.Writer) (*tiles.ImportResult, error) {
-	return importArtifactWithProvenance(ctx, source, artifact, schema, batch, memory, reserve, replace, nil, stdout)
+	return importArtifactWithProvenanceAndCompact(ctx, source, artifact, schema, batch, memory, reserve, replace, nil, false, stdout)
 }
 
 func importArtifactWithProvenance(ctx context.Context, source, artifact string, schema tiles.Schema, batch int, memory, reserve int64, replace bool, provenance map[string]any, stdout io.Writer) (*tiles.ImportResult, error) {
+	return importArtifactWithProvenanceAndCompact(ctx, source, artifact, schema, batch, memory, reserve, replace, provenance, false, stdout)
+}
+
+func importArtifactWithProvenanceAndCompact(ctx context.Context, source, artifact string, schema tiles.Schema, batch int, memory, reserve int64, replace bool, provenance map[string]any, compact bool, stdout io.Writer) (*tiles.ImportResult, error) {
 	start := time.Now()
-	result, err := tiles.ImportMBTiles(ctx, source, artifact, &tiles.ImportOptions{
+	if batch < 0 {
+		return nil, errors.New("import batch must not be negative")
+	}
+	if compact && schema == tiles.SchemaFlat {
+		return nil, errors.New("compact import requires schema auto or normalized; schema flat would discard payload deduplication")
+	}
+	if batch == 0 {
+		var err error
+		batch, err = autoImportBatchSize(ctx, source, memory)
+		if err != nil {
+			return nil, err
+		}
+	}
+	importSource := source
+	if compact {
+		fmt.Fprintln(stdout, "phase=compact")
+		staging, err := compactMBTiles(ctx, source, artifact)
+		if err != nil {
+			return nil, err
+		}
+		defer staging.Close()
+		fmt.Fprintln(stdout, compactStatsLine(staging.Stats))
+		importSource = staging.Path
+		schema = tiles.SchemaNormalized
+		provenance = compactImportProvenance(provenance, source, staging.Stats)
+	}
+	result, err := tiles.ImportMBTiles(ctx, importSource, artifact, &tiles.ImportOptions{
 		Schema: schema, BatchSize: batch, MaxMemoryBytes: memory, MinFreeBytes: reserve, Provenance: provenance, ProgressEvery: time.Second, ReplaceExisting: replace,
 		Progress: func(progress tiles.Progress) {
 			if progress.Phase == "preflight" && progress.Estimate != nil {
@@ -74,8 +177,115 @@ func importArtifactWithProvenance(ctx context.Context, source, artifact string, 
 	})
 	if err == nil {
 		fmt.Fprintf(stdout, "import elapsed=%s\n", time.Since(start).Round(time.Millisecond))
+		if compact {
+			if bytes, sizeErr := artifactDirectoryBytes(artifact); sizeErr == nil {
+				fmt.Fprintf(stdout, "compact artifact-bytes=%dB\n", bytes)
+			}
+		}
 	}
 	return result, err
+}
+
+// autoImportBatchSize selects a fast, bounded import batch without adding a
+// second whole-MBTiles scan before tinySQL's own preflight. It samples at most
+// importBatchSampleRows tile lengths and uses conservative headroom. The
+// source is opened read-only without creating an artifact; the importer
+// remains the authoritative memory gate for all source rows.
+func autoImportBatchSize(ctx context.Context, source string, maxMemory int64) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if maxMemory <= 0 {
+		return 0, errors.New("import max-memory must be positive")
+	}
+	sampledTile, err := sampledMBTileBytes(ctx, source)
+	if err != nil {
+		return 0, err
+	}
+	if sampledTile > (1<<63-1)/importBatchSampleHeadroom {
+		return defaultImportBatchSize, nil
+	}
+	perTile := sampledTile * importBatchSampleHeadroom
+	if perTile < importBatchMinimumTileSize {
+		perTile = importBatchMinimumTileSize
+	}
+	if perTile > (1<<63-1)-importBatchPerRowOverhead {
+		return defaultImportBatchSize, nil
+	}
+	perTile += importBatchPerRowOverhead
+	available := maxMemory - importBatchFixedMemory
+	if available <= 0 || perTile <= 0 {
+		return defaultImportBatchSize, nil
+	}
+	batch := available / perTile
+	if batch < 1 {
+		return defaultImportBatchSize, nil
+	}
+	if batch > defaultAutoImportBatchSize {
+		return defaultAutoImportBatchSize, nil
+	}
+	return int(batch), nil
+}
+
+func sampledMBTileBytes(ctx context.Context, source string) (int64, error) {
+	db, err := sql.Open("sqlite", "file:"+filepath.Clean(source)+"?mode=ro&immutable=1")
+	if err != nil {
+		return 0, fmt.Errorf("open MBTiles source for automatic batch sizing: %w", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		return 0, fmt.Errorf("ping MBTiles source for automatic batch sizing: %w", err)
+	}
+
+	flat, err := sqliteTableExistsContext(ctx, db, "tiles")
+	if err != nil {
+		return 0, err
+	}
+	if flat {
+		return sampledMaxTileBytes(ctx, db, "tiles")
+	}
+	images, err := sqliteTableExistsContext(ctx, db, "images")
+	if err != nil {
+		return 0, err
+	}
+	if images {
+		return sampledMaxTileBytes(ctx, db, "images")
+	}
+	return 0, errors.New("MBTiles source has neither tiles nor images table for automatic batch sizing")
+}
+
+func sqliteTableExistsContext(ctx context.Context, db *sql.DB, table string) (bool, error) {
+	var name string
+	err := db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect MBTiles schema for automatic batch sizing: %w", err)
+	}
+	return true, nil
+}
+
+func sampledMaxTileBytes(ctx context.Context, db *sql.DB, table string) (int64, error) {
+	var max sql.NullInt64
+	var query string
+	switch table {
+	case "tiles":
+		query = "SELECT MAX(length(tile_data)) FROM (SELECT tile_data FROM tiles LIMIT ?)"
+	case "images":
+		query = "SELECT MAX(length(tile_data)) FROM (SELECT tile_data FROM images LIMIT ?)"
+	default:
+		return 0, fmt.Errorf("unsupported MBTiles tile table %q", table)
+	}
+	if err := db.QueryRowContext(ctx, query, importBatchSampleRows).Scan(&max); err != nil {
+		return 0, fmt.Errorf("measure largest MBTiles tile for automatic batch sizing: %w", err)
+	}
+	if !max.Valid || max.Int64 < 0 {
+		return 0, nil
+	}
+	return max.Int64, nil
 }
 
 func commandBenchmark(args []string, stdout, stderr io.Writer) int {

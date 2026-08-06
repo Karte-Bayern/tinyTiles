@@ -14,6 +14,8 @@ const (
 	maxSyncConcurrency     = 32
 )
 
+var errMemoryStoreCacheMiss = errors.New("memory store cache miss")
+
 // SyncRequest selects a bounded set of tiles to retain offline. Ranges are
 // generated directly into workers; the implementation never expands an entire
 // region into a tile slice. Ranges and explicit keys must not overlap.
@@ -74,6 +76,7 @@ func (s *Synchronizer) Sync(ctx context.Context, request SyncRequest) (SyncResul
 	if s.Fetcher == nil {
 		return SyncResult{}, errors.New("offline sync fetcher is nil")
 	}
+	httpFetcher, fetcherResponsesVerified := s.Fetcher.(*HTTPFetcher)
 	if err := request.validate(); err != nil {
 		return SyncResult{}, err
 	}
@@ -81,12 +84,18 @@ func (s *Synchronizer) Sync(ctx context.Context, request SyncRequest) (SyncResul
 	if err != nil {
 		return SyncResult{}, fmt.Errorf("fetch sync manifest: %w", err)
 	}
-	if err := manifest.Validate(); err != nil {
-		return SyncResult{}, fmt.Errorf("validate sync manifest: %w", err)
+	// HTTPFetcher validates the decoded manifest before it returns. Keeping the
+	// generic Fetcher boundary defensive avoids an extra URL parse/allocation
+	// per warm HTTP sync without widening the trusted surface.
+	if !fetcherResponsesVerified {
+		if err := manifest.Validate(); err != nil {
+			return SyncResult{}, fmt.Errorf("validate sync manifest: %w", err)
+		}
 	}
 	if request.Dataset != "" && request.Dataset != manifest.Dataset {
 		return SyncResult{}, fmt.Errorf("requested dataset %q does not match manifest dataset %q", request.Dataset, manifest.Dataset)
 	}
+	verifiedStore := newSyncStoreFastPath(s.Store, manifest.Dataset, manifest.Revision)
 	total, err := request.total()
 	if err != nil {
 		return SyncResult{}, err
@@ -95,6 +104,24 @@ func (s *Synchronizer) Sync(ctx context.Context, request SyncRequest) (SyncResul
 	previous, hadPrevious, err := s.Store.GetManifest(ctx, manifest.Dataset)
 	if err != nil {
 		return SyncResult{}, fmt.Errorf("read cached manifest: %w", err)
+	}
+	// A completed MemoryStore sync has immutable, independently copied tiles
+	// and an active manifest for this revision. With no progress callback to
+	// preserve per-worker callback ordering, bypass the worker pool entirely
+	// when the whole request is already warm. This avoids channels, goroutines,
+	// cancellation machinery and repeated checksum hashing on the dominant
+	// offline-open path. A partial or externally seeded cache falls through to
+	// the normal, fully validating pipeline.
+	if request.Progress == nil && hadPrevious && previous.Revision == manifest.Revision {
+		if memoryStore, ok := s.Store.(*MemoryStore); ok {
+			allCached, err := memoryStore.hasVerifiedTiles(ctx, manifest.Dataset, manifest.Revision, request)
+			if err != nil {
+				return SyncResult{}, fmt.Errorf("read cached tiles: %w", err)
+			}
+			if allCached {
+				return s.publish(ctx, request, manifest, previous, hadPrevious, total, 0, total)
+			}
+		}
 	}
 
 	workers := request.workerCount()
@@ -125,30 +152,52 @@ func (s *Synchronizer) Sync(ctx context.Context, request SyncRequest) (SyncResul
 				if err := workCtx.Err(); err != nil {
 					return
 				}
-				cached, found, err := s.Store.GetTile(workCtx, manifest.Dataset, manifest.Revision, key)
+				var cached Tile
+				var found bool
+				var err error
+				if verifiedStore != nil {
+					cached, found, err = verifiedStore.get(workCtx, manifest.Dataset, manifest.Revision, key)
+				} else {
+					cached, found, err = s.Store.GetTile(workCtx, manifest.Dataset, manifest.Revision, key)
+				}
 				if err != nil {
 					fail(fmt.Errorf("read cached tile %s: %w", key, err))
 					return
 				}
 				if found {
-					if err := verifyTile(cached); err != nil {
-						fail(fmt.Errorf("validate cached tile %s: %w", key, err))
-						return
+					if verifiedStore == nil {
+						if err := verifyTile(cached); err != nil {
+							fail(fmt.Errorf("validate cached tile %s: %w", key, err))
+							return
+						}
 					}
 					state.advance(false, key, request.Progress)
 					continue
 				}
-				tile, err := s.Fetcher.FetchTile(workCtx, manifest, key)
+				var tile Tile
+				if fetcherResponsesVerified {
+					tile, err = httpFetcher.fetchVerifiedTile(workCtx, manifest, key)
+				} else {
+					tile, err = s.Fetcher.FetchTile(workCtx, manifest, key)
+				}
 				if err != nil {
 					fail(fmt.Errorf("fetch tile %s: %w", key, err))
 					return
 				}
-				if err := verifyTile(tile); err != nil {
-					fail(fmt.Errorf("verify tile %s: %w", key, err))
-					return
+				if !fetcherResponsesVerified {
+					if err := verifyTile(tile); err != nil {
+						fail(fmt.Errorf("verify tile %s: %w", key, err))
+						return
+					}
 				}
-				if err := s.Store.PutTile(workCtx, manifest.Dataset, manifest.Revision, key, tile); err != nil {
-					fail(fmt.Errorf("store tile %s: %w", key, err))
+				var storeErr error
+				if verifiedStore != nil {
+					storeErr = verifiedStore.put(workCtx, manifest.Dataset, manifest.Revision, key, tile)
+				} else {
+					storeErr = s.Store.PutTile(workCtx, manifest.Dataset, manifest.Revision, key, tile)
+				}
+				if storeErr != nil {
+					fail(fmt.Errorf("store tile %s: %w", key, storeErr))
 					return
 				}
 				state.advance(true, key, request.Progress)
@@ -177,15 +226,26 @@ func (s *Synchronizer) Sync(ctx context.Context, request SyncRequest) (SyncResul
 	if err := ctx.Err(); err != nil {
 		return SyncResult{}, err
 	}
-	if err := s.Store.PutManifest(ctx, manifest); err != nil {
-		return SyncResult{}, fmt.Errorf("publish cached manifest: %w", err)
+	return s.publish(ctx, request, manifest, previous, hadPrevious, total, state.downloadedCount(), state.reusedCount())
+}
+
+func (s *Synchronizer) publish(ctx context.Context, request SyncRequest, manifest, previous Manifest, hadPrevious bool, total, downloaded, reused uint64) (SyncResult, error) {
+	// The existing active manifest already durably names this exact immutable
+	// revision. Rewriting it after a warm sync turns every offline-open into an
+	// unnecessary atomic write plus fsync on FileStore. Persist it only when a
+	// field actually changed; new tile records have already been atomically
+	// published by their individual store operations.
+	if !hadPrevious || previous != manifest || !canReuseActiveManifest(s.Store) {
+		if err := s.Store.PutManifest(ctx, manifest); err != nil {
+			return SyncResult{}, fmt.Errorf("publish cached manifest: %w", err)
+		}
 	}
 	result := SyncResult{
 		Dataset:        manifest.Dataset,
 		Revision:       manifest.Revision,
 		Total:          total,
-		Downloaded:     state.downloadedCount(),
-		Reused:         state.reusedCount(),
+		Downloaded:     downloaded,
+		Reused:         reused,
 		ManifestWasNew: !hadPrevious || previous.Revision != manifest.Revision,
 	}
 	if request.PrunePrevious && hadPrevious && previous.Revision != manifest.Revision {

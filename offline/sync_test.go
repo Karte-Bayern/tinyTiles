@@ -119,6 +119,95 @@ func TestSynchronizerRejectsChecksumMismatch(t *testing.T) {
 	}
 }
 
+func TestSynchronizerRejectsCorruptMemoryCachedTile(t *testing.T) {
+	store := NewMemoryStore()
+	manifest := testManifest("corrupt-cache")
+	key := TileKey{Z: 1, X: 0, Y: 0}
+	if err := store.PutManifest(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutTile(context.Background(), manifest.Dataset, manifest.Revision, key, Tile{
+		Data:     []byte("corrupt"),
+		Checksum: Checksum([]byte("expected")),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	synchronizer := &Synchronizer{Store: store, Fetcher: &fakeFetcher{manifest: manifest}}
+	if _, err := synchronizer.Sync(context.Background(), SyncRequest{Keys: []TileKey{key}}); err == nil {
+		t.Fatal("corrupt cached tile was reused")
+	}
+}
+
+func TestSynchronizerWarmMemoryStorePreservesProgress(t *testing.T) {
+	store := NewMemoryStore()
+	manifest := testManifest("warm-progress")
+	request := SyncRequest{Keys: []TileKey{{Z: 2, X: 0, Y: 0}, {Z: 2, X: 1, Y: 0}}, Concurrency: 1}
+	synchronizer := &Synchronizer{Store: store, Fetcher: &fakeFetcher{manifest: manifest}}
+	if _, err := synchronizer.Sync(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	var progress []SyncProgress
+	request.Progress = func(update SyncProgress) { progress = append(progress, update) }
+	result, err := synchronizer.Sync(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Downloaded != 0 || result.Reused != uint64(len(request.Keys)) {
+		t.Fatalf("warm progress sync=%#v", result)
+	}
+	if len(progress) != len(request.Keys)+2 || progress[0].Phase != "manifest" || progress[len(progress)-1].Phase != "published" {
+		t.Fatalf("progress=%#v", progress)
+	}
+	for index, update := range progress[1 : len(progress)-1] {
+		if update.Phase != "tile" || update.Completed != uint64(index+1) || update.Reused != uint64(index+1) || update.Downloaded != 0 {
+			t.Fatalf("tile progress %d = %#v", index, update)
+		}
+	}
+}
+
+func TestSynchronizerKeepsCustomStoreManifestCommitSemantics(t *testing.T) {
+	base := NewMemoryStore()
+	store := &manifestWriteCounter{Store: base}
+	manifest := testManifest("stable-manifest")
+	key := TileKey{Z: 1, X: 0, Y: 0}
+	fetcher := &fakeFetcher{manifest: manifest}
+	synchronizer := &Synchronizer{Store: store, Fetcher: fetcher}
+	if _, err := synchronizer.Sync(context.Background(), SyncRequest{Keys: []TileKey{key}}); err != nil {
+		t.Fatal(err)
+	}
+	if store.puts != 1 {
+		t.Fatalf("initial manifest writes=%d, want 1", store.puts)
+	}
+	if _, err := synchronizer.Sync(context.Background(), SyncRequest{Keys: []TileKey{key}}); err != nil {
+		t.Fatal(err)
+	}
+	if store.puts != 2 {
+		t.Fatalf("identical warm manifest writes=%d, want 2", store.puts)
+	}
+	manifest.ContentType = "image/jpeg"
+	fetcher.manifest = manifest
+	if _, err := synchronizer.Sync(context.Background(), SyncRequest{Keys: []TileKey{key}}); err != nil {
+		t.Fatal(err)
+	}
+	if store.puts != 3 {
+		t.Fatalf("changed manifest writes=%d, want 3", store.puts)
+	}
+	active, found, err := base.GetManifest(context.Background(), manifest.Dataset)
+	if err != nil || !found || active.ContentType != "image/jpeg" {
+		t.Fatalf("active manifest=%#v found=%t err=%v", active, found, err)
+	}
+}
+
+type manifestWriteCounter struct {
+	Store
+	puts int
+}
+
+func (s *manifestWriteCounter) PutManifest(ctx context.Context, manifest Manifest) error {
+	s.puts++
+	return s.Store.PutManifest(ctx, manifest)
+}
+
 func TestTileRangeVisitHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	visited := 0

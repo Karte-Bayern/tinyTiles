@@ -80,6 +80,11 @@ func TestDatasetXYZAdapterAndMetadataCopies(t *testing.T) {
 	if got, err := TMSToXYZY(2, 2); err != nil || got != 1 {
 		t.Fatalf("TMSToXYZY = %d, %v", got, err)
 	}
+	for _, coordinate := range [][3]int{{-1, 0, 0}, {2, 4, 0}, {2, 0, 4}} {
+		if _, _, err := dataset.LookupXYZ(t.Context(), coordinate[0], coordinate[1], coordinate[2]); err == nil {
+			t.Fatalf("LookupXYZ accepted invalid coordinate %v", coordinate)
+		}
+	}
 	if err := dataset.Close(); err != nil {
 		t.Fatal(err)
 	}

@@ -132,14 +132,24 @@ func (s *IndexedDBStore) GetTile(ctx context.Context, dataset, revision string, 
 }
 
 func (s *IndexedDBStore) PutTile(ctx context.Context, dataset, revision string, key TileKey, tile Tile) error {
+	return s.putTile(ctx, dataset, revision, key, tile, false)
+}
+
+func (s *IndexedDBStore) putVerifiedTile(ctx context.Context, dataset, revision string, key TileKey, tile Tile) error {
+	return s.putTile(ctx, dataset, revision, key, tile, true)
+}
+
+func (s *IndexedDBStore) putTile(ctx context.Context, dataset, revision string, key TileKey, tile Tile, verified bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := validateCacheKey(dataset, revision, key); err != nil {
 		return err
 	}
-	if err := verifyTile(tile); err != nil {
-		return err
+	if !verified {
+		if err := verifyTile(tile); err != nil {
+			return err
+		}
 	}
 	data := js.Global().Get("Uint8Array").New(len(tile.Data))
 	js.CopyBytesToJS(data, tile.Data)

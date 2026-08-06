@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
 
 // commandBuild provides a one-command PBF-to-tinyTiles path without baking a
@@ -32,6 +34,7 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	maxZoom := fs.Int("maxzoom", 14, "maximum tile zoom")
 	buildingMinZoom := fs.Int("building-minzoom", 12, "minimum building zoom")
 	shards := fs.Int("shards", 256, "temporary generator shard count")
+	shardCompression := fs.Bool("shard-compression", true, "compress temporary generator shards; disable for faster builds with more temporary disk")
 	concurrency := fs.Int("concurrency", 0, "generator decode concurrency; 0 uses its default")
 	reduceConcurrency := fs.Int("reduce-concurrency", 0, "generator reduce concurrency; 0 uses its default")
 	districts := fs.String("districts", "", "optional district-boundary GeoJSON")
@@ -43,7 +46,8 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	centerLon := fs.Float64("center-lon", 0, "optional radius-filter center longitude")
 	radiusKM := fs.Float64("radius-km", 0, "optional radius filter in kilometres")
 	schema := fs.String("schema", "auto", "artifact schema: auto, flat, normalized")
-	batch := fs.Int("batch", 1_000, "rows per bounded artifact import batch")
+	compact := fs.Bool("compact", false, "losslessly deduplicate equal tile payloads into a normalized artifact (uses temporary disk)")
+	batch := fs.Int("batch", defaultImportBatchSize, "rows per bounded artifact import batch; 0 enables automatic tuning within the memory limit")
 	memory := fs.Int64("max-memory", 256<<20, "maximum tinySQL cache budget in bytes")
 	reserve := fs.Int64("min-free", 1<<30, "required free disk reserve in bytes")
 	replace := fs.Bool("replace", false, "atomically replace an existing artifact")
@@ -58,21 +62,25 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	options := kartePreprocessOptions{
-		PBFInputs:         pbfInputs,
-		MinZoom:           *minZoom,
-		MaxZoom:           *maxZoom,
-		BuildingMinZoom:   *buildingMinZoom,
-		Shards:            *shards,
-		Concurrency:       *concurrency,
-		ReduceConcurrency: *reduceConcurrency,
-		Districts:         *districts,
-		MinLat:            *minLat,
-		MinLon:            *minLon,
-		MaxLat:            *maxLat,
-		MaxLon:            *maxLon,
-		CenterLat:         *centerLat,
-		CenterLon:         *centerLon,
-		RadiusKM:          *radiusKM,
+		PBFInputs:           pbfInputs,
+		MinZoom:             *minZoom,
+		MaxZoom:             *maxZoom,
+		BuildingMinZoom:     *buildingMinZoom,
+		Shards:              *shards,
+		ShardCompression:    *shardCompression,
+		ShardCompressionSet: true,
+		Concurrency:         *concurrency,
+		ReduceConcurrency:   *reduceConcurrency,
+		Districts:           *districts,
+		MinLat:              *minLat,
+		MinLon:              *minLon,
+		MaxLat:              *maxLat,
+		MaxLon:              *maxLon,
+		CenterLat:           *centerLat,
+		CenterLon:           *centerLon,
+		RadiusKM:            *radiusKM,
+		CenterLatSet:        flagWasSet(fs, "center-lat"),
+		CenterLonSet:        flagWasSet(fs, "center-lon"),
 	}
 	if err := options.validate(); err != nil {
 		fmt.Fprintf(stderr, "tinytiles build: %v\n", err)
@@ -89,8 +97,20 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	if *batch < 1 || *memory <= 0 || *reserve < 0 {
-		fmt.Fprintln(stderr, "tinytiles build: batch and max-memory must be positive; min-free must not be negative")
+	if *compact && artifactSchema == tiles.SchemaFlat {
+		fmt.Fprintln(stderr, "tinytiles build: --compact requires schema auto or normalized; schema flat would discard payload deduplication")
+		return 2
+	}
+	if *batch < 0 || *memory <= 0 || *reserve < 0 {
+		fmt.Fprintln(stderr, "tinytiles build: batch must be zero (automatic) or positive; max-memory must be positive; min-free must not be negative")
+		return 2
+	}
+	if err := validateArtifactBuildPaths(fs.Arg(1), pbfInputs, *districts); err != nil {
+		fmt.Fprintf(stderr, "tinytiles build: %v\n", err)
+		return 2
+	}
+	if err := checkArtifactDestination(fs.Arg(1), *replace); err != nil {
+		fmt.Fprintf(stderr, "tinytiles build: %v\n", err)
 		return 2
 	}
 
@@ -169,7 +189,7 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	}
 
 	fmt.Fprintln(stdout, "phase=import")
-	result, err := importArtifactWithProvenance(ctx, mbtiles, fs.Arg(1), artifactSchema, *batch, *memory, *reserve, *replace, provenance, stdout)
+	result, err := importArtifactWithProvenanceAndCompact(ctx, mbtiles, fs.Arg(1), artifactSchema, *batch, *memory, *reserve, *replace, provenance, *compact, stdout)
 	if err != nil {
 		fmt.Fprintf(stderr, "tinytiles build: import generated MBTiles: %v\n", err)
 		return 1
@@ -188,9 +208,11 @@ type kartePreprocessOptions struct {
 	PBFInputs                                 []string
 	MBTiles, ShardDir, Districts              string
 	MinZoom, MaxZoom, BuildingMinZoom, Shards int
+	ShardCompression, ShardCompressionSet     bool
 	Concurrency, ReduceConcurrency            int
 	MinLat, MinLon, MaxLat, MaxLon            float64
 	CenterLat, CenterLon, RadiusKM            float64
+	CenterLatSet, CenterLonSet                bool
 }
 
 func (o kartePreprocessOptions) validate() error {
@@ -211,6 +233,9 @@ func (o kartePreprocessOptions) validate() error {
 	}
 	if math.IsNaN(o.RadiusKM) || math.IsInf(o.RadiusKM, 0) || o.RadiusKM < 0 {
 		return fmt.Errorf("radius-km must be a finite value >= 0")
+	}
+	if o.RadiusKM > 0 && (!o.CenterLatSet || !o.CenterLonSet) {
+		return fmt.Errorf("radius-km requires both center-lat and center-lon")
 	}
 	bboxProvided := o.MinLat != 0 || o.MinLon != 0 || o.MaxLat != 0 || o.MaxLon != 0
 	if o.RadiusKM > 0 && bboxProvided {
@@ -242,7 +267,7 @@ func (o kartePreprocessOptions) args() []string {
 		"-maxzoom", strconv.Itoa(o.MaxZoom),
 		"-building-minzoom", strconv.Itoa(o.BuildingMinZoom),
 		"-shards", strconv.Itoa(o.Shards),
-		"-shard-compression=true",
+		"-shard-compression=" + strconv.FormatBool(o.shardCompressionEnabled()),
 		"-clean",
 		"-districts", o.Districts,
 	}
@@ -287,7 +312,7 @@ func (o kartePreprocessOptions) provenance(generatorPath string) (map[string]any
 		"maxzoom":           o.MaxZoom,
 		"building_minzoom":  o.BuildingMinZoom,
 		"shards":            o.Shards,
-		"shard_compression": true,
+		"shard_compression": o.shardCompressionEnabled(),
 	}
 	if o.Concurrency > 0 {
 		config["concurrency"] = o.Concurrency
@@ -313,6 +338,13 @@ func (o kartePreprocessOptions) provenance(generatorPath string) (map[string]any
 		},
 		"generator_config": config,
 	}, nil
+}
+
+// shardCompressionEnabled preserves the historical adapter default for the
+// zero value used by tests and internal helpers. commandBuild sets the marker
+// so an explicit --shard-compression=false is propagated unchanged.
+func (o kartePreprocessOptions) shardCompressionEnabled() bool {
+	return !o.ShardCompressionSet || o.ShardCompression
 }
 
 func parsePBFInputs(raw string) ([]string, error) {
@@ -374,6 +406,61 @@ func checkMBTilesDestination(path string, replace bool) error {
 	return nil
 }
 
+// checkArtifactDestination rejects an accidental rebuild over an existing
+// artifact before the (potentially long-running) PBF generator starts. The
+// importer performs the same check before publication, but doing it here
+// avoids wasting a full generation run on an operator mistake.
+func checkArtifactDestination(path string, replace bool) error {
+	if _, err := os.Lstat(path); err == nil {
+		if !replace {
+			return fmt.Errorf("artifact %q already exists; pass --replace to replace it", path)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("artifact target %q: %w", path, err)
+	}
+	return nil
+}
+
+// validateArtifactBuildPaths prevents --replace from turning any build input
+// (or a directory that contains one) into the published artifact. Publication
+// replaces the target path atomically, so letting either path overlap would
+// otherwise delete the input after a successful generation.
+func validateArtifactBuildPaths(artifact string, pbfInputs []string, districts string) error {
+	for _, input := range pbfInputs {
+		if err := rejectOverlappingBuildPaths("artifact", artifact, "PBF input", input); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(districts) != "" {
+		if err := rejectOverlappingBuildPaths("artifact", artifact, "district input", districts); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rejectOverlappingBuildPaths(firstLabel, firstPath, secondLabel, secondPath string) error {
+	same, err := samePath(firstPath, secondPath)
+	if err != nil {
+		return err
+	}
+	if same {
+		return fmt.Errorf("%s %q must not replace %s %q", firstLabel, firstPath, secondLabel, secondPath)
+	}
+	if within, err := pathWithin(firstPath, secondPath); err != nil {
+		return err
+	} else if within {
+		return fmt.Errorf("%s %q must not be inside %s %q", firstLabel, firstPath, secondLabel, secondPath)
+	}
+	if within, err := pathWithin(secondPath, firstPath); err != nil {
+		return err
+	} else if within {
+		return fmt.Errorf("%s %q must not contain %s %q", firstLabel, firstPath, secondLabel, secondPath)
+	}
+	return nil
+}
+
 func validatePersistentBuildPaths(mbtiles, artifact string, pbfInputs []string, districts string) error {
 	for _, input := range pbfInputs {
 		same, err := samePath(mbtiles, input)
@@ -418,39 +505,48 @@ func samePath(a, b string) (bool, error) {
 	return aAbs == bAbs, nil
 }
 
-// canonicalExistingPath resolves symlinks when the path exists. That prevents
-// --mbtiles-out from accidentally naming the same on-disk file as a PBF input
-// through a different symlink spelling. For a not-yet-created destination the
-// cleaned absolute path is the strongest portable comparison available.
+// canonicalExistingPath resolves symlinks in the path or its nearest existing
+// parent. That prevents a not-yet-created output below a symlinked directory
+// from evading overlap checks against an existing input.
 func canonicalExistingPath(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
 	}
 	abs = filepath.Clean(abs)
-	resolved, err := filepath.EvalSymlinks(abs)
-	if err == nil {
-		return filepath.Clean(resolved), nil
+	for candidate := abs; ; candidate = filepath.Dir(candidate) {
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err == nil {
+			relative, relErr := filepath.Rel(candidate, abs)
+			if relErr != nil {
+				return "", relErr
+			}
+			return filepath.Clean(filepath.Join(resolved, relative)), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		if parent := filepath.Dir(candidate); parent == candidate {
+			return abs, nil
+		}
 	}
-	if os.IsNotExist(err) {
-		return abs, nil
-	}
-	return "", err
 }
 
 // pathWithin reports whether child is parent itself or is nested inside it.
-// It deliberately works on cleaned absolute paths: output destinations often
-// do not exist yet, so EvalSymlinks cannot provide a reliable check here.
+// Existing paths are canonicalized first so an input reached through a
+// symlink cannot evade a check against its real destination. A not-yet-created
+// output remains a cleaned absolute path, which is the strongest portable
+// comparison possible before its parent creates it.
 func pathWithin(child, parent string) (bool, error) {
-	childAbs, err := filepath.Abs(child)
+	childAbs, err := canonicalExistingPath(child)
 	if err != nil {
 		return false, err
 	}
-	parentAbs, err := filepath.Abs(parent)
+	parentAbs, err := canonicalExistingPath(parent)
 	if err != nil {
 		return false, err
 	}
-	relative, err := filepath.Rel(filepath.Clean(parentAbs), filepath.Clean(childAbs))
+	relative, err := filepath.Rel(parentAbs, childAbs)
 	if err != nil {
 		return false, err
 	}
@@ -463,4 +559,14 @@ func quoteArguments(args []string) string {
 		quoted[i] = strconv.Quote(arg)
 	}
 	return strings.Join(quoted, " ")
+}
+
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(current *flag.Flag) {
+		if current.Name == name {
+			found = true
+		}
+	})
+	return found
 }

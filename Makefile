@@ -3,7 +3,7 @@ SHELL := /bin/bash
 
 GO ?= go
 BUILD_DIR ?= dist
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 0.1.0-dev)
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo v1.0.0-dev)
 SQLITE_TAGS := sqliteimport
 GOFILES := $(shell find . -name '*.go' -not -path './dist/*')
 WASM_DIR := $(BUILD_DIR)/wasm
@@ -17,7 +17,7 @@ MEMORY ?= 16777216
 READERS ?= 8
 
 .DEFAULT_GOAL := help
-.PHONY: help fmt fmt-check tidy tidy-check vet test test-short test-race coverage bench bench-fixture build build-reader-cli build-server install build-demo-server build-native-demo reader-no-sqlite-check wasm wasm-demo wasm-gzip wasm-package wasm-check demo-check serve-wasm ci vulncheck clean
+.PHONY: help fmt fmt-check tidy tidy-check vet test test-short test-race coverage bench bench-fixture build build-reader-cli build-server install build-demo-server build-native-demo reader-no-sqlite-check wasm wasm-demo wasm-gzip wasm-package wasm-check demo-check serve-wasm ci release-version-check release-check vulncheck clean
 
 help: ## Show all supported development targets.
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*##/ {printf "%-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -72,7 +72,7 @@ install: ## Install the tagged native CLI into GOPATH/bin.
 
 build-server: ## Build the SQLite-free standalone HTTP server into dist/.
 	mkdir -p $(BUILD_DIR)
-	$(GO) build $(BUILD_FLAGS) -o $(BUILD_DIR)/tinytiles-server ./cmd/tinytiles-server
+	$(GO) build $(BUILD_FLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/tinytiles-server ./cmd/tinytiles-server
 
 build-demo-server: build-server ## Backwards-compatible alias for build-server.
 
@@ -111,6 +111,17 @@ serve-wasm: wasm-demo ## Serve the generated browser demo at http://localhost:80
 	cd $(WASM_DIR) && python3 -m http.server 8081 --bind 127.0.0.1
 
 ci: fmt-check tidy-check vet test test-race reader-no-sqlite-check wasm-check ## Run the checks intended for CI.
+
+release-version-check: build build-reader-cli build-server wasm-package ## Verify that every shipped runtime embeds VERSION.
+	$(BUILD_DIR)/tinytiles version | rg -xF "$(VERSION)"
+	$(BUILD_DIR)/tinytiles-reader version | rg -xF "$(VERSION)"
+	$(BUILD_DIR)/tinytiles-server --version | rg -xF "$(VERSION)"
+	rg -a -F "$(VERSION)" $(WASM_DIR)/tinytiles.wasm >/dev/null
+
+release-check: ## Run the full release gate; reserve this for a candidate, not each edit.
+	@release_version="$(VERSION)"; if [[ ! "$$release_version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$$ ]]; then echo "release-check requires a clean SemVer tag, for example VERSION=v1.0.0"; exit 2; fi
+	$(MAKE) ci
+	$(MAKE) release-version-check
 
 vulncheck: ## Run govulncheck when installed; otherwise show the install command.
 	@if ! command -v govulncheck >/dev/null 2>&1; then echo "Install with: go install golang.org/x/vuln/cmd/govulncheck@latest"; exit 0; fi; govulncheck ./...

@@ -18,7 +18,8 @@ validated, SQLite-free read path is useful.
 - direct OSM PBF → MBTiles → `.ttiles` orchestration through an explicit
   Karte.Bayern-compatible generator adapter;
 - an importable concurrent `Dataset`, a mountable HTTP server and a small
-  standalone server binary, plus durable native and browser IndexedDB caches;
+  standalone server binary with automatic vector/raster MIME and URL-extension
+  inference, plus durable native and browser IndexedDB caches;
 - reproducible tests, race checks, WASM compilation, benchmarks and demos.
 
 ## Quick start
@@ -59,6 +60,15 @@ Build from PBF when a compatible generator is available:
 `build` does not invent a map style. The external generator owns OSM feature
 selection, styling and MVT layer semantics; tinyTiles owns the bounded import,
 artifact contract and reader/cache path.
+
+Temporary generator shards stay compressed by default to limit workspace disk.
+On a fast local SSD with sufficient temporary capacity, pass
+`--shard-compression=false` to trade that disk for faster PBF generation; the
+choice is recorded in the published artifact provenance.
+
+The same `--compact` flag is available on `tinytiles build`; it deduplicates
+the generated MBTiles only for the final `.ttiles` import and does not alter a
+requested `--mbtiles-out` file.
 
 ## Architecture
 
@@ -122,10 +132,28 @@ directly into the paged index; tiles, source rows and index trees are never
 held as one full in-memory collection. `Ctrl-C` is propagated through the PBF
 generator and importer and leaves the previous published artifact untouched.
 
+Pass `--batch 0` to opt into automatic batch tuning: it sizes a batch from a
+bounded sample of source tiles and the configured `--max-memory`, capped at
+8,192 rows. This avoids a second whole-file scan before import while reducing
+checkpoint overhead for ordinary tiles; a large sampled tile can select a
+smaller bounded batch. The default and every positive `--batch` are used
+exactly as requested; tinySQL's complete preflight remains the final memory
+and disk gate.
+
 `--schema auto` preserves the source's flat or normalized shape. The importer
 validates all tile keys, index completeness, checksums, metadata and tile
 digests before publication. An existing destination requires `--replace` and
 is swapped only after the new artifact has passed validation.
+
+Pass `--compact` to build a losslessly content-deduplicated normalized
+artifact. Equal tile payloads are stored once while every coordinate still
+returns its original bytes; the temporary hash index verifies a byte-for-byte
+match before reusing a payload. It is most useful for repeated transparent,
+ocean or placeholder tiles and uses additional temporary disk while staging.
+`--compact` requires `--schema auto` or `--schema normalized` (flat would
+discard the deduplication). The command reports deduplicated payload bytes and
+the final published artifact size; if most tiles are unique, normalized index
+overhead can outweigh the saving.
 
 ### PBF build adapter
 
@@ -206,9 +234,20 @@ var tiles interface {
 } = dataset
 
 // Or mount a generic XYZ/TileJSON/TMS-sync HTTP surface in an existing mux.
-tileServer, err := server.New(server.Config{Dataset: dataset, DatasetID: "region"})
+tileServer, err := server.New(server.Config{
+    Dataset: dataset, DatasetID: "region",
+    PrefetchWorkers: 2, PrefetchQueue: 512, PrefetchMaxTiles: 1024,
+})
 if err != nil { /* fail startup */ }
+defer tileServer.Close()
 http.Handle("/tiles/", http.StripPrefix("/tiles/", tileServer.XYZHandler()))
+
+// Call after a trusted routing result is available. It warms the crossed tiles
+// plus one neighboring tile at the active navigation zoom in the background.
+route := []server.RoutePoint{{Latitude: 48.14, Longitude: 11.58}, {Latitude: 48.18, Longitude: 11.65}}
+_, err = tileServer.PrefetchRoute(context.Background(), route, server.RoutePrefetchOptions{
+    Zoom: 14, Radius: 1,
+})
 ```
 
 `Dataset.LookupTMS` and `Dataset.ScanTMS` are explicitly TMS; `LookupXYZ` and
@@ -230,6 +269,7 @@ Build the reference server and native client:
 make build-server build-native-demo
 ./dist/tinytiles-server \
   -artifact /path/to/region.ttiles -dataset dach \
+  -tile-cache-bytes $((32 * 1024 * 1024)) \
   -cors http://localhost:8081
 
 ./dist/tinytiles-native-client \
@@ -242,13 +282,34 @@ make build-server build-native-demo
 validated paged artifact through `tinySQL/tiles`. The `tinytiles` build/import
 CLI intentionally retains the tag because it reads SQLite MBTiles input.
 
+The server keeps a byte-bounded 32 MiB immutable tile cache by default. A
+cache hit avoids a pager lookup, payload allocation and SHA-256 recomputation.
+After payload eviction it retains compact SHA-256 values, so a revisited
+uncached tile still avoids rehashing its full body. Concurrent cold requests
+for the same tile share one pager read. Set `-tile-cache-bytes -1` on
+memory-constrained reader processes to disable it, or choose an explicit byte
+budget for the expected working set.
+
+Routing integrations can call `Server.PrefetchRoute` with trusted WGS84 route
+points. It rasterizes crossed tiles in route order, optionally warms a small
+neighbor radius, and submits at most 1,024 keys to two background workers by
+default. The API deliberately has no public HTTP endpoint: route input must be
+authorized and rate-limited by the embedding application. `Server.Close` stops
+workers before the owning application closes its `Dataset`.
+
 The standalone server intentionally has no authentication, authorization, rate
 limiting or deployment configuration. It is a correct artifact-serving binary,
 not a replacement for an application's edge policy. It exposes XYZ tiles at
-`/tiles/{z}/{x}/{y}.mvt`, TileJSON at `/tilejson.json`, metadata at
+`/tiles/{z}/{x}/{y}.{format}`, TileJSON at `/tilejson.json`, metadata at
 `/metadata`, and the browser-safe revisioned TMS sync protocol at
-`/sync/manifest.json`. See [examples/README.md](examples/README.md) for the
-browser demo walkthrough.
+`/sync/manifest.json`. The standard MBTiles `format` metadata is translated to
+the matching HTTP representation: `pbf`/`mvt` serves
+`application/vnd.mapbox-vector-tile` at `.mvt`, while aerial and raster sources
+using `png`, `jpg`/`jpeg`, `webp` or `avif` serve the matching image MIME type
+and extension. TileJSON always advertises the selected URL. Embedded servers
+can override either with `server.Config{ContentType: ..., TileExtension: ...}`
+for a private representation. See [examples/README.md](examples/README.md) for
+the browser demo walkthrough.
 
 ### Browser/WASM cache
 

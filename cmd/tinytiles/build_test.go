@@ -72,6 +72,7 @@ func TestKartePreprocessOptionsArgs(t *testing.T) {
 		MaxZoom:           14,
 		BuildingMinZoom:   12,
 		Shards:            64,
+		ShardCompression:  true,
 		Concurrency:       3,
 		ReduceConcurrency: 2,
 		MinLat:            47.1,
@@ -108,6 +109,26 @@ func TestKartePreprocessOptionsArgs(t *testing.T) {
 	}
 }
 
+func TestKartePreprocessOptionsShardCompression(t *testing.T) {
+	options := kartePreprocessOptions{
+		PBFInputs:           []string{"source.osm.pbf"},
+		MBTiles:             "/tmp/source.mbtiles",
+		ShardDir:            "/tmp/shards",
+		MinZoom:             5,
+		MaxZoom:             14,
+		BuildingMinZoom:     12,
+		Shards:              64,
+		ShardCompression:    false,
+		ShardCompressionSet: true,
+	}
+	for _, arg := range options.args() {
+		if arg == "-shard-compression=false" {
+			return
+		}
+	}
+	t.Fatalf("generator args did not disable shard compression: %#v", options.args())
+}
+
 func TestKartePreprocessOptionsValidate(t *testing.T) {
 	valid := kartePreprocessOptions{PBFInputs: []string{"source.osm.pbf"}, MinZoom: 5, MaxZoom: 14, BuildingMinZoom: 12, Shards: 1}
 	if err := valid.validate(); err != nil {
@@ -123,6 +144,28 @@ func TestKartePreprocessOptionsValidate(t *testing.T) {
 		if err := options.validate(); err == nil {
 			t.Fatalf("invalid options accepted: %+v", options)
 		}
+	}
+}
+
+func TestKartePreprocessOptionsRadiusRequiresExplicitCenter(t *testing.T) {
+	base := kartePreprocessOptions{
+		PBFInputs:       []string{"source.osm.pbf"},
+		MinZoom:         5,
+		MaxZoom:         14,
+		BuildingMinZoom: 12,
+		Shards:          1,
+		RadiusKM:        10,
+	}
+	if err := base.validate(); err == nil {
+		t.Fatal("radius without an explicit center accepted")
+	}
+	base.CenterLatSet = true
+	if err := base.validate(); err == nil {
+		t.Fatal("radius with only center-lat accepted")
+	}
+	base.CenterLonSet = true
+	if err := base.validate(); err != nil {
+		t.Fatalf("radius with an explicit center rejected: %v", err)
 	}
 }
 
@@ -167,6 +210,13 @@ func TestBuildPathSafety(t *testing.T) {
 	if inside, err := pathWithin(filepath.Join(root, "elsewhere"), artifact); err != nil || inside {
 		t.Fatalf("pathWithin outside=%t err=%v, want false nil", inside, err)
 	}
+	artifactAlias := filepath.Join(root, "artifact-alias")
+	if err := os.Symlink(root, artifactAlias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if inside, err := pathWithin(pbf, artifactAlias); err != nil || !inside {
+		t.Fatalf("pathWithin through symlink inside=%t err=%v, want true nil", inside, err)
+	}
 	alias := filepath.Join(root, "source-alias.osm.pbf")
 	if err := os.WriteFile(pbf, []byte("pbf"), 0o644); err != nil {
 		t.Fatal(err)
@@ -176,6 +226,43 @@ func TestBuildPathSafety(t *testing.T) {
 	}
 	if err := validatePersistentBuildPaths(pbf, artifact, []string{alias}, ""); err == nil {
 		t.Fatal("symlinked PBF replacement accepted")
+	}
+}
+
+func TestBuildArtifactPathSafety(t *testing.T) {
+	root := t.TempDir()
+	pbf := filepath.Join(root, "source.osm.pbf")
+	if err := os.WriteFile(pbf, []byte("pbf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	districtDir := filepath.Join(root, "district-input")
+	if err := os.MkdirAll(districtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	district := filepath.Join(districtDir, "districts.geojson")
+	if err := os.WriteFile(district, []byte(`{"type":"FeatureCollection","features":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		artifact string
+		district string
+	}{
+		{name: "same PBF", artifact: pbf},
+		{name: "inside PBF", artifact: filepath.Join(pbf, "artifact.ttiles")},
+		{name: "contains PBF", artifact: root},
+		{name: "same district", artifact: district, district: district},
+		{name: "contains district", artifact: districtDir, district: district},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateArtifactBuildPaths(tc.artifact, []string{pbf}, tc.district); err == nil {
+				t.Fatalf("unsafe artifact path %q accepted", tc.artifact)
+			}
+		})
+	}
+	if err := validateArtifactBuildPaths(filepath.Join(root, "safe.ttiles"), []string{pbf}, district); err != nil {
+		t.Fatalf("safe artifact path rejected: %v", err)
 	}
 }
 
@@ -189,6 +276,70 @@ func TestCommandBuildRejectsMissingGenerator(t *testing.T) {
 	code := run([]string{"build", "--generator", filepath.Join(temp, "missing-generator"), pbf, filepath.Join(temp, "region.ttiles")}, &stdout, &stderr)
 	if code != 2 || !strings.Contains(stderr.String(), "not found") {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestCommandBuildRejectsCompactFlatSchemaBeforeGenerator(t *testing.T) {
+	temp := t.TempDir()
+	pbf := filepath.Join(temp, "region.osm.pbf")
+	if err := os.WriteFile(pbf, []byte("pbf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"build", "--compact", "--schema=flat", "--generator", filepath.Join(temp, "missing-generator"), pbf, filepath.Join(temp, "region.ttiles")}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "schema auto or normalized") || strings.Contains(stderr.String(), "not found") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestCommandBuildRejectsUnsafeArtifactBeforeGenerator(t *testing.T) {
+	temp := t.TempDir()
+	pbf := filepath.Join(temp, "region.osm.pbf")
+	if err := os.WriteFile(pbf, []byte("pbf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"build", "--replace", "--generator", filepath.Join(temp, "missing-generator"), pbf, pbf}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "must not replace PBF input") || strings.Contains(stderr.String(), "generator") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestCommandBuildRejectsExistingArtifactBeforeGenerator(t *testing.T) {
+	temp := t.TempDir()
+	pbf := filepath.Join(temp, "region.osm.pbf")
+	if err := os.WriteFile(pbf, []byte("pbf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(temp, "region.ttiles")
+	if err := os.Mkdir(artifact, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"build", "--generator", filepath.Join(temp, "missing-generator"), pbf, artifact}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "artifact") || !strings.Contains(stderr.String(), "already exists") || strings.Contains(stderr.String(), "generator") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestCommandBuildRequiresExplicitRadiusCenter(t *testing.T) {
+	temp := t.TempDir()
+	pbf := filepath.Join(temp, "region.osm.pbf")
+	if err := os.WriteFile(pbf, []byte("pbf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	missingGenerator := filepath.Join(temp, "missing-generator")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"build", "--generator", missingGenerator, "--radius-km", "10", pbf, filepath.Join(temp, "region.ttiles")}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "requires both center-lat and center-lon") {
+		t.Fatalf("missing center: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{"build", "--generator", missingGenerator, "--radius-km", "10", "--center-lat", "0", "--center-lon", "0", pbf, filepath.Join(temp, "zero-center.ttiles")}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "not found") || strings.Contains(stderr.String(), "requires both center-lat and center-lon") {
+		t.Fatalf("explicit zero center: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 }
 
@@ -207,6 +358,8 @@ func TestCommandBuildEndToEnd(t *testing.T) {
 		"--generator", os.Args[0],
 		"--mbtiles-out", mbtiles,
 		"--shards", "1",
+		"--shard-compression=false",
+		"--compact",
 		"--concurrency", "1",
 		pbf,
 		artifact,
@@ -214,7 +367,7 @@ func TestCommandBuildEndToEnd(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("build code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "phase=generate") || !strings.Contains(stdout.String(), "phase=import") {
+	if !strings.Contains(stdout.String(), "phase=generate") || !strings.Contains(stdout.String(), "phase=import") || !strings.Contains(stdout.String(), "phase=compact") || !strings.Contains(stdout.String(), `"-shard-compression=false"`) {
 		t.Fatalf("missing build phases in stdout=%q", stdout.String())
 	}
 	manifest, err := tiles.ValidateArtifact(context.Background(), artifact)
@@ -227,8 +380,11 @@ func TestCommandBuildEndToEnd(t *testing.T) {
 	if manifest.Provenance["kind"] != "osm-pbf" {
 		t.Fatalf("PBF provenance missing from manifest: %#v", manifest.Provenance)
 	}
+	if compact, ok := manifest.Provenance["tinytiles_compaction"].(map[string]any); !ok || compact["tile_id"] != "base36-sequential" {
+		t.Fatalf("compact provenance=%#v", manifest.Provenance["tinytiles_compaction"])
+	}
 	config, ok := manifest.Provenance["generator_config"].(map[string]any)
-	if !ok || config["minzoom"] != float64(5) || config["maxzoom"] != float64(14) {
+	if !ok || config["minzoom"] != float64(5) || config["maxzoom"] != float64(14) || config["shard_compression"] != false {
 		t.Fatalf("generator config provenance=%#v", manifest.Provenance["generator_config"])
 	}
 	reader, err := tiles.OpenArtifact(context.Background(), artifact, tiles.OpenOptions{MaxMemoryBytes: 1 << 20})
@@ -239,6 +395,38 @@ func TestCommandBuildEndToEnd(t *testing.T) {
 	tile, found, err := reader.Lookup(context.Background(), tiles.Key{Z: 8, X: 137, Y: 167})
 	if err != nil || !found || !bytes.Equal(tile.Data, []byte{1, 2, 3}) {
 		t.Fatalf("tile found=%t data=%x err=%v", found, tile.Data, err)
+	}
+}
+
+func TestCommandBuildKeepsShardCompressionByDefault(t *testing.T) {
+	temp := t.TempDir()
+	pbf := filepath.Join(temp, "region.osm.pbf")
+	if err := os.WriteFile(pbf, []byte("pbf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(temp, "region.ttiles")
+	t.Setenv(fakePreprocessEnv, "1")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"build",
+		"--generator", os.Args[0],
+		"--shards", "1",
+		pbf,
+		artifact,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("build code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"-shard-compression=true"`) || !strings.Contains(stdout.String(), "batch=1000") || !strings.Contains(stdout.String(), "batches-of=1000") {
+		t.Fatalf("default build settings changed: %q", stdout.String())
+	}
+	manifest, err := tiles.ValidateArtifact(context.Background(), artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, ok := manifest.Provenance["generator_config"].(map[string]any)
+	if !ok || config["shard_compression"] != true {
+		t.Fatalf("default compression provenance=%#v", manifest.Provenance["generator_config"])
 	}
 }
 

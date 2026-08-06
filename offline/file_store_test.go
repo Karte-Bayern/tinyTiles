@@ -10,6 +10,21 @@ import (
 	"testing"
 )
 
+type wrappedFileStore struct{ *FileStore }
+
+func TestSyncFastPathUsesOnlyExactFileStore(t *testing.T) {
+	store, err := NewFileStore(filepath.Join(t.TempDir(), "cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newSyncStoreFastPath(store, "demo", "r1") == nil {
+		t.Fatal("FileStore did not select its verified fast path")
+	}
+	if newSyncStoreFastPath(&wrappedFileStore{FileStore: store}, "demo", "r1") != nil {
+		t.Fatal("FileStore wrapper bypassed its Store implementation")
+	}
+}
+
 func TestFileStorePersistsTilesAndManifests(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "cache")
 	store, err := NewFileStore(root)
@@ -42,6 +57,47 @@ func TestFileStorePersistsTilesAndManifests(t *testing.T) {
 	}
 	if _, found, err := reopened.GetTile(context.Background(), manifest.Dataset, manifest.Revision, key); err != nil || found {
 		t.Fatalf("deleted revision returned found=%t err=%v", found, err)
+	}
+}
+
+func TestSynchronizerFileStoreDoesNotRewriteIdenticalManifest(t *testing.T) {
+	store, err := NewFileStore(filepath.Join(t.TempDir(), "cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := testManifest("stable-manifest")
+	key := TileKey{Z: 1, X: 0, Y: 0}
+	fetcher := &fakeFetcher{manifest: manifest}
+	synchronizer := &Synchronizer{Store: store, Fetcher: fetcher}
+	if _, err := synchronizer.Sync(context.Background(), SyncRequest{Keys: []TileKey{key}}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(store.manifestPath(manifest.Dataset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := synchronizer.Sync(context.Background(), SyncRequest{Keys: []TileKey{key}}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(store.manifestPath(manifest.Dataset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("identical active manifest was atomically rewritten")
+	}
+
+	manifest.ContentType = "image/jpeg"
+	fetcher.manifest = manifest
+	if _, err := synchronizer.Sync(context.Background(), SyncRequest{Keys: []TileKey{key}}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := os.Stat(store.manifestPath(manifest.Dataset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(after, changed) {
+		t.Fatal("changed manifest was not atomically published")
 	}
 }
 

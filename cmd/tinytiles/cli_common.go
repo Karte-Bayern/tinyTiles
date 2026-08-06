@@ -11,7 +11,10 @@ import (
 	"os"
 )
 
-var version = "0.1.0-dev"
+// version is replaced with a SemVer tag by the release build. Keep the
+// fallback visibly pre-release so locally built development binaries cannot be
+// mistaken for the v1.0.0 artifact.
+var version = "v1.0.0-dev"
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 

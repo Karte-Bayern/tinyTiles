@@ -16,6 +16,7 @@ import (
 const (
 	defaultMaxManifestBytes int64 = 1 << 20
 	defaultMaxTileBytes     int64 = 16 << 20
+	tileAcceptHeader              = "application/vnd.mapbox-vector-tile, image/*;q=0.9, application/octet-stream;q=0.8"
 
 	// HeaderTileChecksum is the SHA-256 of the exact raw tile bytes stored by
 	// the client. It is intentionally a response header rather than part of
@@ -59,7 +60,7 @@ func (f *HTTPFetcher) FetchManifest(ctx context.Context) (Manifest, error) {
 	if response.StatusCode != http.StatusOK {
 		return Manifest{}, httpStatusError("fetch manifest", response)
 	}
-	body, err := readLimited(response.Body, f.maxManifestSize())
+	body, err := readLimitedHint(response.Body, f.maxManifestSize(), response.ContentLength)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("read manifest: %w", err)
 	}
@@ -110,18 +111,28 @@ func (f *HTTPFetcher) FetchTile(ctx context.Context, manifest Manifest, key Tile
 	if err != nil {
 		return Tile{}, err
 	}
-	parsed, err := url.Parse(endpoint)
+	return f.fetchTileURL(ctx, manifest, endpoint)
+}
+
+// fetchVerifiedTile is the Synchronizer-only fast path. Sync has already
+// validated the manifest and every requested key before workers start, while
+// FetchManifest on this exact built-in fetcher has resolved relative templates
+// to an absolute URL. Avoiding the repeated validation and template parse is
+// measurable for large local/LAN syncs; fetchTileURL still validates the final
+// HTTP(S) destination through net/http before sending it.
+func (f *HTTPFetcher) fetchVerifiedTile(ctx context.Context, manifest Manifest, key TileKey) (Tile, error) {
+	return f.fetchTileURL(ctx, manifest, renderTileURL(manifest.TileURLTemplate, manifest.Revision, key))
+}
+
+func (f *HTTPFetcher) fetchTileURL(ctx context.Context, manifest Manifest, endpoint string) (Tile, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return Tile{}, fmt.Errorf("parse tile URL: %w", err)
 	}
-	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-		return Tile{}, fmt.Errorf("unsupported tile URL scheme %q", parsed.Scheme)
+	if (request.URL.Scheme != "http" && request.URL.Scheme != "https") || request.URL.Host == "" {
+		return Tile{}, fmt.Errorf("unsupported tile URL scheme %q", request.URL.Scheme)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return Tile{}, err
-	}
-	request.Header.Set("Accept", "application/vnd.mapbox-vector-tile, application/octet-stream;q=0.8")
+	request.Header.Set("Accept", tileAcceptHeader)
 	f.applyHeaders(request)
 	response, err := f.httpClient().Do(request)
 	if err != nil {
@@ -134,7 +145,7 @@ func (f *HTTPFetcher) FetchTile(ctx context.Context, manifest Manifest, key Tile
 	if response.ContentLength > f.maxTileSize() {
 		return Tile{}, fmt.Errorf("tile response declares %d bytes, above limit %d", response.ContentLength, f.maxTileSize())
 	}
-	data, err := readLimited(response.Body, f.maxTileSize())
+	data, err := readLimitedHint(response.Body, f.maxTileSize(), response.ContentLength)
 	if err != nil {
 		return Tile{}, fmt.Errorf("read tile: %w", err)
 	}
@@ -178,7 +189,7 @@ func (f *HTTPFetcher) httpClient() *http.Client {
 	if f.Client != nil {
 		return f.Client
 	}
-	return http.DefaultClient
+	return defaultHTTPFetcherClient()
 }
 
 func (f *HTTPFetcher) maxManifestSize() int64 {
@@ -204,13 +215,91 @@ func (f *HTTPFetcher) applyHeaders(request *http.Request) {
 }
 
 func readLimited(reader io.Reader, max int64) ([]byte, error) {
+	return readLimitedHint(reader, max, -1)
+}
+
+// readLimitedHint is the bounded response reader used for normal HTTP bodies.
+// Content-Length is already supplied and checked by net/http, so reserving it
+// upfront avoids io.ReadAll's repeated growth and final copy for ordinary tile
+// responses. An unknown or untrusted hint falls back to the same bounded
+// streaming behavior.
+func readLimitedHint(reader io.Reader, max, hint int64) ([]byte, error) {
 	if max <= 0 {
 		return nil, errors.New("response size limit must be positive")
 	}
-	data, err := io.ReadAll(io.LimitReader(reader, max+1))
+	if hint > max {
+		return nil, fmt.Errorf("response declares %d bytes, above limit %d", hint, max)
+	}
+	limit := max
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if limit < maxInt64 {
+		limit++
+	}
+	if hint < 0 {
+		data, err := io.ReadAll(io.LimitReader(reader, limit))
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(data)) > max {
+			return nil, fmt.Errorf("response exceeds %d bytes", max)
+		}
+		return data, nil
+	}
+	maxInt := int64(^uint(0) >> 1)
+	if hint <= maxInt {
+		// A fixed Content-Length lets us allocate the final payload exactly.
+		// bytes.Buffer.Grow rounds an 8 KiB tile to a much larger backing array
+		// on several targets, which used to dominate the sync allocation rate.
+		// The small tail check retains the old behavior for a broken custom
+		// RoundTripper whose body is longer than its declared length.
+		data := make([]byte, int(hint))
+		if _, err := io.ReadFull(reader, data); err != nil {
+			return nil, err
+		}
+		return readDeclaredResponseTail(reader, data, max)
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, limit))
 	if err != nil {
 		return nil, err
 	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("response exceeds %d bytes", max)
+	}
+	return data, nil
+}
+
+// readDeclaredResponseTail preserves the bounded-reader behavior for a
+// malformed custom Response.Body that contains bytes after Content-Length.
+// Standard net/http response bodies end at their declared length, so this
+// normally performs one allocation-free EOF read.
+func readDeclaredResponseTail(reader io.Reader, data []byte, max int64) ([]byte, error) {
+	var first [1]byte
+	n, err := reader.Read(first[:])
+	if n == 0 {
+		if err == nil || errors.Is(err, io.EOF) {
+			return data, nil
+		}
+		return nil, err
+	}
+	if int64(len(data))+int64(n) > max {
+		return nil, fmt.Errorf("response exceeds %d bytes", max)
+	}
+	data = append(data, first[:n]...)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return data, nil
+		}
+		return nil, err
+	}
+	remaining := max - int64(len(data))
+	if remaining < int64(^uint64(0)>>1) {
+		remaining++
+	}
+	tail, err := io.ReadAll(io.LimitReader(reader, remaining))
+	if err != nil {
+		return nil, err
+	}
+	data = append(data, tail...)
 	if int64(len(data)) > max {
 		return nil, fmt.Errorf("response exceeds %d bytes", max)
 	}

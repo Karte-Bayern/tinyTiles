@@ -16,7 +16,10 @@ import (
 	"github.com/Karte-Bayern/tinyTiles/offline"
 )
 
-var version = "0.1.0-dev"
+// version is replaced with a SemVer tag by the release build. Keep the
+// fallback visibly pre-release so locally built development bundles cannot be
+// mistaken for the v1.0.0 artifact.
+var version = "v1.0.0-dev"
 
 var browserCache struct {
 	sync.Mutex

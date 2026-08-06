@@ -196,11 +196,17 @@ func (d *Dataset) LookupTMS(ctx context.Context, key tiles.Key) (tiles.Tile, boo
 // LookupXYZ performs one slippy-map XYZ tile lookup. The stored artifact
 // always uses TMS; only this explicit boundary flips the row.
 func (d *Dataset) LookupXYZ(ctx context.Context, z, x, yXYZ int) (tiles.Tile, bool, error) {
-	yTMS, err := XYZToTMSY(z, yXYZ)
+	key := tiles.Key{Z: z, X: x, Y: yXYZ}
+	if err := key.Validate(); err != nil {
+		return tiles.Tile{}, false, err
+	}
+	key.Y = (1 << z) - 1 - yXYZ
+	reader, err := d.acquire(ctx)
 	if err != nil {
 		return tiles.Tile{}, false, err
 	}
-	return d.LookupTMS(ctx, tiles.Key{Z: z, X: x, Y: yTMS})
+	defer d.release(reader)
+	return reader.Lookup(ctx, key)
 }
 
 // GetTileXYZ is a migration-friendly adapter for servers with the established

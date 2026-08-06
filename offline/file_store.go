@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -122,25 +123,31 @@ func (s *FileStore) GetTile(ctx context.Context, dataset, revision string, key T
 	if err := validateCacheKey(dataset, revision, key); err != nil {
 		return Tile{}, false, err
 	}
+	return s.getTileAt(ctx, s.tilePath(dataset, revision, key))
+}
+
+// getTileAt reads a path built exclusively from cache-owned path components.
+// Synchronizer binds a revision directory once and uses this helper to avoid
+// revalidating and hashing its already-validated namespace for every tile.
+func (s *FileStore) getTileAt(ctx context.Context, path string) (Tile, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return Tile{}, false, err
+	}
+	// Keep DeleteRevision and SetMaxTileSize out until the complete read has
+	// finished. Multiple readers and writers still proceed concurrently under
+	// the shared lock, while a delete cannot remove a file between its size
+	// check and read.
 	s.mu.RLock()
-	path := s.tilePath(dataset, revision, key)
+	defer s.mu.RUnlock()
 	max := s.maxTileSize
-	s.mu.RUnlock()
-	info, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		return Tile{}, false, nil
-	}
-	if err != nil {
-		return Tile{}, false, fmt.Errorf("stat cached tile: %w", err)
-	}
 	recordLimit, err := maxTileRecordSize(max)
 	if err != nil {
 		return Tile{}, false, err
 	}
-	if info.Size() > recordLimit {
-		return Tile{}, false, fmt.Errorf("cached tile exceeds configured maximum %d bytes", max)
+	data, err := readBoundedFile(path, recordLimit)
+	if os.IsNotExist(err) {
+		return Tile{}, false, nil
 	}
-	data, err := os.ReadFile(path)
 	if err != nil {
 		return Tile{}, false, fmt.Errorf("read cached tile: %w", err)
 	}
@@ -154,6 +161,34 @@ func (s *FileStore) GetTile(ctx context.Context, dataset, revision string, key T
 	return tile, true, nil
 }
 
+// readBoundedFile opens once, obtains the trusted file length from that open
+// descriptor and then reads exactly that many bytes. It avoids the separate
+// path Stat plus os.ReadFile sequence while retaining a hard allocation bound
+// for corrupt cache records.
+func readBoundedFile(path string, maxBytes int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() < 0 || info.Size() > maxBytes {
+		return nil, fmt.Errorf("cached tile exceeds configured maximum %d bytes", maxBytes)
+	}
+	maxInt := int64(^uint(0) >> 1)
+	if info.Size() > maxInt {
+		return nil, errors.New("cached tile record is too large for this platform")
+	}
+	data := make([]byte, int(info.Size()))
+	if _, err := io.ReadFull(file, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
 func maxTileRecordSize(maxTileSize int64) (int64, error) {
 	overhead := int64(maxTileHeaderBytes) + int64(len(diskTileMagic)) + 4
 	const maxInt64 = int64(^uint64(0) >> 1)
@@ -164,19 +199,48 @@ func maxTileRecordSize(maxTileSize int64) (int64, error) {
 }
 
 func (s *FileStore) PutTile(ctx context.Context, dataset, revision string, key TileKey, tile Tile) error {
+	return s.putTile(ctx, dataset, revision, key, tile, false)
+}
+
+// putVerifiedTile accepts a tile verified by Synchronizer during this exact
+// sync pass. The public PutTile boundary continues to verify arbitrary caller
+// input, while this avoids hashing the same downloaded payload a third time.
+func (s *FileStore) putVerifiedTile(ctx context.Context, dataset, revision string, key TileKey, tile Tile) error {
+	return s.putTile(ctx, dataset, revision, key, tile, true)
+}
+
+// putVerifiedTileAt writes a path built from cache-owned components after the
+// Synchronizer has verified the response checksum. It is intentionally
+// unexported so arbitrary caller input remains subject to full validation.
+func (s *FileStore) putVerifiedTileAt(ctx context.Context, path string, tile Tile) error {
+	return s.putTileAt(ctx, path, tile)
+}
+
+func (s *FileStore) putTile(ctx context.Context, dataset, revision string, key TileKey, tile Tile, verified bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := validateCacheKey(dataset, revision, key); err != nil {
 		return err
 	}
-	if err := verifyTile(tile); err != nil {
+	if !verified {
+		if err := verifyTile(tile); err != nil {
+			return err
+		}
+	}
+	return s.putTileAt(ctx, s.tilePath(dataset, revision, key), tile)
+}
+
+func (s *FileStore) putTileAt(ctx context.Context, path string, tile Tile) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Atomic renames make concurrent writers safe. Hold a shared lock rather
+	// than serializing disk I/O behind the exclusive lock; DeleteRevision and
+	// SetMaxTileSize still wait for all active operations before changing state.
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	max := s.maxTileSize
-	path := s.tilePath(dataset, revision, key)
-	s.mu.RUnlock()
 	if int64(len(tile.Data)) > max {
 		return fmt.Errorf("tile is %d bytes, above configured maximum %d", len(tile.Data), max)
 	}
@@ -184,8 +248,6 @@ func (s *FileStore) PutTile(ctx context.Context, dataset, revision string, key T
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return writeAtomicFile(path, encoded, 0o644)
 }
 
@@ -255,7 +317,10 @@ func decodeDiskTile(encoded []byte, maxTileSize int64) (Tile, error) {
 	if err := json.Unmarshal(encoded[len(diskTileMagic)+4:len(diskTileMagic)+4+headerLength], &header); err != nil {
 		return Tile{}, err
 	}
-	return Tile{Data: append([]byte(nil), payload...), ContentType: header.ContentType, ContentEncoding: header.ContentEncoding, ETag: header.ETag, Checksum: header.Checksum}, nil
+	// GetTile reads the encoded record into a fresh, private allocation. The
+	// payload can therefore be returned directly: its slice capacity ends at
+	// the payload boundary and no cache-owned memory is exposed or reused.
+	return Tile{Data: payload, ContentType: header.ContentType, ContentEncoding: header.ContentEncoding, ETag: header.ETag, Checksum: header.Checksum}, nil
 }
 
 func writeAtomicFile(path string, data []byte, mode os.FileMode) error {

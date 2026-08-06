@@ -172,6 +172,15 @@ type Tile struct {
 	Data []byte
 }
 
+// TileStats describes the expanded tile stream without reading payload data.
+// TileBytes counts bytes after expanding run-length entries because a .ttiles
+// artifact stores one payload per addressed coordinate in its flat schema.
+type TileStats struct {
+	Tiles        uint64
+	TileBytes    uint64
+	MaxTileBytes uint64
+}
+
 // TMSRow converts this tile's XYZ row to the MBTiles/TMS row convention.
 func (t Tile) TMSRow() uint32 {
 	return uint32(1)<<t.Z - 1 - t.Y
@@ -482,6 +491,76 @@ func (a *Archive) EachTile(ctx context.Context, visit func(Tile) error) error {
 	}
 	if a.header.AddressedTiles != 0 && remaining != 0 {
 		return fmt.Errorf("pmtiles: header declares %d addressed tiles but the directories hold %d", a.header.AddressedTiles, a.header.AddressedTiles-remaining)
+	}
+	return nil
+}
+
+// InspectTiles walks only PMTiles directories and computes exact bounds for a
+// subsequent direct artifact import. Tile payload sections are not read.
+func (a *Archive) InspectTiles(ctx context.Context) (TileStats, error) {
+	root, err := a.readDirectory(a.header.RootDirectoryOffset, a.header.RootDirectoryLength, maxRootDirectoryBytes, "root directory")
+	if err != nil {
+		return TileStats{}, err
+	}
+	budget := a.header.AddressedTiles
+	if budget == 0 {
+		budget = maxAddressedTiles
+	}
+	remaining := budget
+	var stats TileStats
+	if err := a.inspectTiles(ctx, root, 0, &remaining, &stats); err != nil {
+		return TileStats{}, err
+	}
+	if a.header.AddressedTiles != 0 && remaining != 0 {
+		return TileStats{}, fmt.Errorf("pmtiles: header declares %d addressed tiles but the directories hold %d", a.header.AddressedTiles, a.header.AddressedTiles-remaining)
+	}
+	return stats, nil
+}
+
+func (a *Archive) inspectTiles(ctx context.Context, entries []entry, depth int, remaining *uint64, stats *TileStats) error {
+	for _, current := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if current.runLength == 0 {
+			if depth >= maxLeafDepth {
+				return fmt.Errorf("pmtiles: leaf directories nest deeper than %d levels", maxLeafDepth)
+			}
+			if current.length > maxLeafDirectoryBytes {
+				return fmt.Errorf("pmtiles: leaf directory is %d bytes, above the %d-byte limit", current.length, maxLeafDirectoryBytes)
+			}
+			offset, err := addOffset(a.header.LeafDirectoryOffset, current.offset)
+			if err != nil {
+				return err
+			}
+			leaf, err := a.readDirectory(offset, current.length, maxLeafDirectoryBytes, "leaf directory")
+			if err != nil {
+				return err
+			}
+			if err := a.inspectTiles(ctx, leaf, depth+1, remaining, stats); err != nil {
+				return err
+			}
+			continue
+		}
+		if current.runLength > *remaining {
+			return fmt.Errorf("pmtiles: directories address more tiles than the header's %d", a.header.AddressedTiles)
+		}
+		if current.length > maxTileBytes {
+			return fmt.Errorf("pmtiles: tile at id %d is %d bytes, above the %d-byte limit", current.tileID, current.length, maxTileBytes)
+		}
+		if current.runLength != 0 && current.length > ^uint64(0)/current.runLength {
+			return errors.New("pmtiles: expanded tile byte count overflows")
+		}
+		expandedBytes := current.length * current.runLength
+		if stats.TileBytes > ^uint64(0)-expandedBytes || stats.Tiles > ^uint64(0)-current.runLength {
+			return errors.New("pmtiles: expanded tile statistics overflow")
+		}
+		stats.Tiles += current.runLength
+		stats.TileBytes += expandedBytes
+		if current.length > stats.MaxTileBytes {
+			stats.MaxTileBytes = current.length
+		}
+		*remaining -= current.runLength
 	}
 	return nil
 }

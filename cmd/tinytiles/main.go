@@ -146,12 +146,44 @@ func importArtifactWithProvenanceAndCompact(ctx context.Context, source, artifac
 	if compact && schema == tiles.SchemaFlat {
 		return nil, errors.New("compact import requires schema auto or normalized; schema flat would discard payload deduplication")
 	}
-	// A PMTiles v3 archive is converted to a temporary flat MBTiles source
-	// first, so it reaches exactly the same validated, atomically published
-	// import path as any other source. Detection is by header magic, not file
-	// extension.
+	// A default PMTiles v3 import streams directly into the artifact writer.
+	// Explicit normalized/compact imports retain the older staging path because
+	// they require global payload deduplication. Detection is by header magic,
+	// not file extension.
 	if pmtiles.IsArchive(source) {
 		fmt.Fprintln(stdout, "phase=pmtiles")
+		if !compact && schema != tiles.SchemaNormalized {
+			direct, err := openPMTilesTileSource(ctx, source)
+			if err != nil {
+				return nil, err
+			}
+			defer direct.Close()
+			fmt.Fprintln(stdout, pmtilesDirectStatsLine(direct.stats))
+			provenance = pmtilesDirectImportProvenance(provenance, source, direct.stats)
+			resolvedBatch, adjusted := tileStreamBatchSize(batch, direct.stats.MaxTileBytes, memory)
+			if adjusted {
+				fmt.Fprintf(stdout, "batch-adjustment requested=%d resolved=%d reason=bounded-tile-stream-memory\n", batch, resolvedBatch)
+			}
+			batch = resolvedBatch
+			result, err := tiles.ImportTiles(ctx, direct, artifact, &tiles.ImportOptions{
+				Schema: tiles.SchemaFlat, BatchSize: batch, MaxMemoryBytes: memory,
+				MinFreeBytes: reserve, Provenance: provenance,
+				ProgressEvery: time.Second, ReplaceExisting: replace,
+				Progress: func(progress tiles.Progress) {
+					if progress.Phase == "preflight" && progress.Estimate != nil {
+						e := progress.Estimate
+						fmt.Fprintf(stdout, "preflight tiles=%d source=%dB estimated-disk=%dB working-set=%dB available-disk=%dB batch=%d\n", e.TileCount, e.SourceBytes, e.EstimatedDisk, e.EstimatedMemory, e.AvailableDisk, e.BatchSize)
+					} else if progress.Phase == "published" {
+						fmt.Fprintf(stdout, "published tiles=%d batches-of=%d\n", progress.RowsWritten, progress.BatchSize)
+					}
+				},
+			})
+			if err == nil {
+				fmt.Fprintf(stdout, "import elapsed=%s\n", time.Since(start).Round(time.Millisecond))
+			}
+			return result, err
+		}
+		fmt.Fprintln(stdout, "pmtiles-mode=mbtiles-staging reason=normalized-or-compact")
 		staging, err := stagePMTiles(ctx, source, artifact)
 		if err != nil {
 			return nil, err
@@ -211,6 +243,31 @@ func importArtifactWithProvenanceAndCompact(ctx context.Context, source, artifac
 		}
 	}
 	return result, err
+}
+
+func tileStreamBatchSize(requested int, maxTileBytes, maxMemory int64) (resolved int, adjusted bool) {
+	available := maxMemory - importBatchFixedMemory
+	if available <= 0 || maxTileBytes < 0 || maxTileBytes > math.MaxInt64-importBatchPerRowOverhead {
+		if requested == 0 {
+			return 1, false
+		}
+		return 1, requested != 1
+	}
+	perTile := maxTileBytes + importBatchPerRowOverhead
+	batch := available / perTile
+	if batch < 1 {
+		batch = 1
+	}
+	if batch > defaultAutoImportBatchSize {
+		batch = defaultAutoImportBatchSize
+	}
+	if requested == 0 {
+		return int(batch), false
+	}
+	if int64(requested) > batch {
+		return int(batch), true
+	}
+	return requested, false
 }
 
 // resolveAutoArtifactSchema avoids the normalized map→image join on the

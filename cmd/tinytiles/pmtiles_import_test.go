@@ -44,8 +44,11 @@ func TestImportPMTilesArchivePublishesArtifact(t *testing.T) {
 	if code := commandImport([]string{"--min-free", "0", source, artifact}, &stdout, &stdout); code != 0 {
 		t.Fatalf("import exited %d: %s", code, stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "phase=pmtiles") {
-		t.Fatalf("import did not report the PMTiles staging phase: %s", stdout.String())
+	if !strings.Contains(stdout.String(), "phase=pmtiles") || !strings.Contains(stdout.String(), "pmtiles mode=direct") {
+		t.Fatalf("import did not report the direct PMTiles phase: %s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "staging=") || strings.Contains(stdout.String(), "pmtiles-mode=mbtiles-staging") {
+		t.Fatalf("default PMTiles import unexpectedly used MBTiles staging: %s", stdout.String())
 	}
 
 	dataset, err := tinytiles.Open(context.Background(), artifact, tinytiles.OpenOptions{Readers: 1})
@@ -53,6 +56,13 @@ func TestImportPMTilesArchivePublishesArtifact(t *testing.T) {
 		t.Fatalf("open published artifact: %v", err)
 	}
 	defer dataset.Close()
+	provenance, ok := dataset.Info().Provenance["tinytiles_pmtiles_import"].(map[string]any)
+	if !ok || provenance["mode"] != "pmtiles-v3-direct-stream" {
+		t.Fatalf("direct import provenance missing: %#v", dataset.Info().Provenance)
+	}
+	if _, staged := provenance["staging_mbtiles_bytes"]; staged {
+		t.Fatalf("direct import provenance still records MBTiles staging: %#v", provenance)
+	}
 
 	// XYZ (1,0,0) is TMS row 1; XYZ (1,0,1) is TMS row 0.
 	for _, want := range []struct {
@@ -159,5 +169,59 @@ func TestImportPMTilesRejectsUndecodableCompression(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "zstd") {
 		t.Fatalf("error does not name the unsupported compression: %s", stdout.String())
+	}
+}
+
+func TestCompactPMTilesImportReportsStagingFallback(t *testing.T) {
+	workDir := t.TempDir()
+	source := filepath.Join(workDir, "compact.pmtiles")
+	pmtilestest.Build(t, source, pmtilestest.Options{
+		TileType: pmtilestest.TileTypeMVT,
+		Tiles: []pmtilestest.Tile{
+			{TileID: pmtiles.ZxyToID(1, 0, 0), Data: []byte("same")},
+			{TileID: pmtiles.ZxyToID(1, 0, 1), Data: []byte("same")},
+		},
+	})
+	artifact := filepath.Join(workDir, "compact.ttiles")
+	var output bytes.Buffer
+	if code := commandImport([]string{"--compact", "--min-free", "0", source, artifact}, &output, &output); code != 0 {
+		t.Fatalf("compact import exited %d: %s", code, output.String())
+	}
+	if !strings.Contains(output.String(), "pmtiles-mode=mbtiles-staging reason=normalized-or-compact") {
+		t.Fatalf("compact staging fallback was not reported: %s", output.String())
+	}
+	info, err := tiles.ValidateArtifact(context.Background(), artifact)
+	if err != nil {
+		t.Fatalf("validate compact artifact: %v", err)
+	}
+	if info.Schema != tiles.SchemaNormalized {
+		t.Fatalf("compact artifact schema=%s, want normalized", info.Schema)
+	}
+}
+
+func TestDirectPMTilesImportBoundsDefaultBatchForLargeTiles(t *testing.T) {
+	workDir := t.TempDir()
+	source := filepath.Join(workDir, "large.pmtiles")
+	payload := bytes.Repeat([]byte{0x5a}, 128<<10)
+	pmtilestest.Build(t, source, pmtilestest.Options{
+		TileType: pmtilestest.TileTypePNG,
+		Tiles:    []pmtilestest.Tile{{TileID: 0, Data: payload}},
+	})
+	artifact := filepath.Join(workDir, "large.ttiles")
+	var output bytes.Buffer
+	if code := commandImport([]string{"--min-free", "0", source, artifact}, &output, &output); code != 0 {
+		t.Fatalf("large-tile direct import exited %d: %s", code, output.String())
+	}
+	if !strings.Contains(output.String(), "batch-adjustment requested=1000") {
+		t.Fatalf("memory-safe batch adjustment not reported: %s", output.String())
+	}
+	dataset, err := tinytiles.Open(context.Background(), artifact, tinytiles.OpenOptions{Readers: 1})
+	if err != nil {
+		t.Fatalf("open large-tile artifact: %v", err)
+	}
+	defer dataset.Close()
+	tile, found, err := dataset.LookupTMS(context.Background(), tiles.Key{Z: 0, X: 0, Y: 0})
+	if err != nil || !found || !bytes.Equal(tile.Data, payload) {
+		t.Fatalf("large tile changed: bytes=%d found=%t err=%v", len(tile.Data), found, err)
 	}
 }

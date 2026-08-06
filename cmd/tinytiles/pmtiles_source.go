@@ -6,13 +6,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/Karte-Bayern/tinyTiles/internal/pmtiles"
+	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
 
 // pmtilesStagingStats describes a PMTiles to MBTiles staging pass.
@@ -21,10 +24,104 @@ type pmtilesStagingStats struct {
 	StagingMBTilesBytes int64
 	Tiles               int64
 	TileBytes           int64
+	MaxTileBytes        int64
 	MinZoom             int
 	MaxZoom             int
 	Format              string
 	ContentEncoding     string
+}
+
+// pmtilesTileSource exposes PMTiles directly through tinySQL's generic tile
+// stream contract. No SQLite database or MBTiles staging file is created.
+type pmtilesTileSource struct {
+	path     string
+	archive  *pmtiles.Archive
+	metadata map[string]string
+	stats    pmtilesStagingStats
+}
+
+func openPMTilesTileSource(ctx context.Context, path string) (*pmtilesTileSource, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat PMTiles source: %w", err)
+	}
+	archive, err := pmtiles.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = archive.Close()
+		}
+	}()
+	header := archive.Header()
+	if encoding := header.TileCompression.ContentEncoding(); encoding != "" && encoding != "gzip" {
+		return nil, fmt.Errorf("PMTiles archive stores tiles with %s compression; tinyTiles imports uncompressed or gzip tile payloads", header.TileCompression)
+	}
+	metadata, err := pmtilesMetadataRows(archive, header)
+	if err != nil {
+		return nil, err
+	}
+	streamStats, err := archive.InspectTiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if streamStats.Tiles == 0 {
+		return nil, fmt.Errorf("PMTiles archive %s contains no tiles", filepath.Base(path))
+	}
+	if streamStats.Tiles > math.MaxInt64 || streamStats.TileBytes > math.MaxInt64 || streamStats.MaxTileBytes > math.MaxInt64 {
+		return nil, errors.New("PMTiles expanded tile stream exceeds supported size")
+	}
+	source := &pmtilesTileSource{
+		path:     path,
+		archive:  archive,
+		metadata: metadata,
+		stats: pmtilesStagingStats{
+			SourcePMTilesBytes: info.Size(), Tiles: int64(streamStats.Tiles),
+			TileBytes: int64(streamStats.TileBytes), MaxTileBytes: int64(streamStats.MaxTileBytes),
+			MinZoom: int(header.MinZoom), MaxZoom: int(header.MaxZoom),
+			Format: metadata["format"], ContentEncoding: header.TileCompression.ContentEncoding(),
+		},
+	}
+	keep = true
+	return source, nil
+}
+
+func (s *pmtilesTileSource) Close() error {
+	if s == nil || s.archive == nil {
+		return nil
+	}
+	err := s.archive.Close()
+	s.archive = nil
+	return err
+}
+
+func (s *pmtilesTileSource) Info(context.Context) (tiles.SourceInfo, error) {
+	if s == nil || s.archive == nil {
+		return tiles.SourceInfo{}, errors.New("PMTiles source is closed")
+	}
+	metadata := make(map[string]string, len(s.metadata))
+	for name, value := range s.metadata {
+		metadata[name] = value
+	}
+	return tiles.SourceInfo{
+		Name: filepath.Base(s.path), SourceBytes: s.stats.SourcePMTilesBytes,
+		TileCount: s.stats.Tiles, TileBytes: s.stats.TileBytes,
+		MaxTileBytes: s.stats.MaxTileBytes, Metadata: metadata,
+	}, nil
+}
+
+func (s *pmtilesTileSource) ScanTiles(ctx context.Context, visit func(tiles.Tile) error) error {
+	if s == nil || s.archive == nil {
+		return errors.New("PMTiles source is closed")
+	}
+	return s.archive.EachTile(ctx, func(tile pmtiles.Tile) error {
+		return visit(tiles.Tile{
+			Key:  tiles.Key{Z: int(tile.Z), X: int(tile.X), Y: int(tile.TMSRow())},
+			Data: tile.Data,
+		})
+	})
 }
 
 // pmtilesStagingSource is a private, temporary flat MBTiles source produced
@@ -332,21 +429,31 @@ func copyPMTilesTiles(ctx context.Context, archive *pmtiles.Archive, db *sql.DB)
 }
 
 func pmtilesImportProvenance(provenance map[string]any, source string, stats pmtilesStagingStats) map[string]any {
+	return pmtilesProvenance(provenance, source, stats, "pmtiles-v3-to-mbtiles", true)
+}
+
+func pmtilesDirectImportProvenance(provenance map[string]any, source string, stats pmtilesStagingStats) map[string]any {
+	return pmtilesProvenance(provenance, source, stats, "pmtiles-v3-direct-stream", false)
+}
+
+func pmtilesProvenance(provenance map[string]any, source string, stats pmtilesStagingStats, mode string, staged bool) map[string]any {
 	out := make(map[string]any, len(provenance)+1)
 	for key, value := range provenance {
 		out[key] = value
 	}
 	entry := map[string]any{
-		"mode":                  "pmtiles-v3-to-mbtiles",
-		"source":                filepath.Base(filepath.Clean(source)),
-		"source_pmtiles_bytes":  stats.SourcePMTilesBytes,
-		"staging_mbtiles_bytes": stats.StagingMBTilesBytes,
-		"tiles":                 stats.Tiles,
-		"tile_bytes":            stats.TileBytes,
-		"minzoom":               stats.MinZoom,
-		"maxzoom":               stats.MaxZoom,
-		"coordinates":           "xyz-source-flipped-to-tms",
-		"payloads":              "byte-identical",
+		"mode":                 mode,
+		"source":               filepath.Base(filepath.Clean(source)),
+		"source_pmtiles_bytes": stats.SourcePMTilesBytes,
+		"tiles":                stats.Tiles,
+		"tile_bytes":           stats.TileBytes,
+		"minzoom":              stats.MinZoom,
+		"maxzoom":              stats.MaxZoom,
+		"coordinates":          "xyz-source-flipped-to-tms",
+		"payloads":             "byte-identical",
+	}
+	if staged {
+		entry["staging_mbtiles_bytes"] = stats.StagingMBTilesBytes
 	}
 	if stats.Format != "" {
 		entry["format"] = stats.Format
@@ -356,6 +463,17 @@ func pmtilesImportProvenance(provenance map[string]any, source string, stats pmt
 	}
 	out["tinytiles_pmtiles_import"] = entry
 	return out
+}
+
+func pmtilesDirectStatsLine(stats pmtilesStagingStats) string {
+	line := fmt.Sprintf("pmtiles mode=direct tiles=%d payload=%dB zooms=%d-%d", stats.Tiles, stats.TileBytes, stats.MinZoom, stats.MaxZoom)
+	if stats.Format != "" {
+		line += " format=" + stats.Format
+	}
+	if stats.ContentEncoding != "" {
+		line += " tile-encoding=" + stats.ContentEncoding
+	}
+	return line
 }
 
 func pmtilesStatsLine(stats pmtilesStagingStats) string {

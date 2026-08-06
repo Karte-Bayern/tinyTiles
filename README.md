@@ -387,15 +387,20 @@ rather than its filename:
 ./dist/tinytiles import --min-free 0 region.pmtiles region.ttiles/
 ```
 
-The archive is staged into a temporary MBTiles source beside the destination
-and then published through the ordinary validated import path. Tile payloads
-are copied byte for byte; the one transformation is the required XYZ→TMS row
-flip, applied exactly once. Run-length entries are expanded to individual
-coordinates, and header/JSON metadata — including `vector_layers`, `tilestats`
-and a terrain `encoding` — is mapped onto the MBTiles rows the server already
-relays into TileJSON. Only uncompressed or gzip sections and tile payloads are
-supported; brotli and zstd are reported rather than guessed at. Writing
-PMTiles remains out of scope.
+The default flat import streams the archive directly into `.ttiles`; it does
+not create an SQLite or MBTiles staging file. It still uses the ordinary
+bounded, validated and atomic publication path. Tile payloads are copied byte
+for byte; the one transformation is the required XYZ→TMS row flip, applied
+exactly once. Run-length entries are expanded to individual coordinates, and
+header/JSON metadata — including `vector_layers`, `tilestats` and a terrain
+`encoding` — is mapped onto the metadata table the server relays into
+TileJSON. `--compact` and an explicitly normalized destination retain MBTiles
+staging because global payload deduplication requires an external index. Only
+uncompressed or gzip sections and tile payloads are supported; brotli and zstd
+are reported rather than guessed at. Writing PMTiles remains out of scope.
+For direct imports, the requested batch is automatically reduced when the
+largest source tile would otherwise exceed `--max-memory`; the CLI reports the
+resolved value as `batch-adjustment`.
 
 ### PBF build adapter
 

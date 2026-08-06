@@ -424,16 +424,22 @@ Header-Magic und nicht am Dateinamen:
 ./dist/tinytiles import --min-free 0 region.pmtiles region.ttiles/
 ```
 
-Das Archiv wird neben dem Ziel in eine temporäre MBTiles-Quelle überführt und
-dann über den gewöhnlichen, vollständig validierten Importpfad veröffentlicht.
-Kachel-Payloads werden Byte für Byte übernommen; die einzige Transformation ist
-der notwendige XYZ→TMS-Zeilentausch, der genau einmal angewendet wird.
-Run-Length-Einträge werden zu einzelnen Koordinaten expandiert, und
-Header-/JSON-Metadaten — einschließlich `vector_layers`, `tilestats` und einem
-Gelände-`encoding` — werden auf die MBTiles-Zeilen abgebildet, die der Server
-bereits in TileJSON weitergibt. Unterstützt werden nur unkomprimierte oder
-gzip-komprimierte Abschnitte und Payloads; brotli und zstd werden gemeldet
-statt geraten. Das Schreiben von PMTiles bleibt außerhalb des Projektumfangs.
+Der standardmäßige flache Import streamt das Archiv direkt nach `.ttiles`; es
+entsteht keine SQLite- oder MBTiles-Zwischendatei. Der begrenzte, vollständig
+validierte und atomare Veröffentlichungspfad bleibt erhalten. Kachel-Payloads
+werden Byte für Byte übernommen; die einzige Transformation ist der notwendige
+XYZ→TMS-Zeilentausch, der genau einmal angewendet wird. Run-Length-Einträge
+werden zu einzelnen Koordinaten expandiert, und Header-/JSON-Metadaten —
+einschließlich `vector_layers`, `tilestats` und einem Gelände-`encoding` —
+werden auf die Metadatentabelle abgebildet, die der Server in TileJSON
+weitergibt. `--compact` und ein ausdrücklich normalisiertes Ziel verwenden
+weiterhin MBTiles-Staging, weil die globale Payload-Deduplizierung einen
+externen Index benötigt. Unterstützt werden nur unkomprimierte oder
+gzip-komprimierte Abschnitte und Payloads; brotli und zstd werden gemeldet statt
+geraten. Das Schreiben von PMTiles bleibt außerhalb des Projektumfangs.
+Bei direkten Imports wird der angeforderte Batch automatisch verkleinert, wenn
+die größte Quellkachel sonst `--max-memory` überschreiten würde; die CLI meldet
+den aufgelösten Wert als `batch-adjustment`.
 
 ### PBF-Build-Adapter
 

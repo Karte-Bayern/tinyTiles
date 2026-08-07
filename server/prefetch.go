@@ -44,13 +44,35 @@ type RoutePrefetchOptions struct {
 	MaxTiles int
 }
 
-// PrefetchResult describes work accepted by the bounded background queue.
-// Queued jobs may include already cached keys; workers discard those cheaply.
+// XYZRange is an inclusive slippy-map viewport. It intentionally mirrors
+// tiles.Range but uses the top-left-origin row convention that map clients
+// already use; PrefetchXYZRange performs the one required conversion to the
+// artifact's TMS keys.
+type XYZRange struct {
+	Z    int
+	XMin int
+	XMax int
+	YMin int
+	YMax int
+}
+
+func (r XYZRange) validate() error {
+	// TMS and XYZ use the same numeric coordinate domain; only their row
+	// origin differs, so tiles.Range's bound validation applies directly.
+	return (tiles.Range{Z: r.Z, XMin: r.XMin, XMax: r.XMax, YMin: r.YMin, YMax: r.YMax}).Validate()
+}
+
+// PrefetchResult describes work submitted to predictive caching. Considered is
+// the number of caller-supplied keys within the configured work budget;
+// AlreadyCached and AlreadyQueued explain why a considered key was not added
+// to the background queue. Dropped means the bounded queue had no capacity.
 type PrefetchResult struct {
-	Considered int
-	Queued     int
-	Dropped    int
-	Truncated  bool
+	Considered    int
+	Queued        int
+	AlreadyCached int
+	AlreadyQueued int
+	Dropped       int
+	Truncated     bool
 }
 
 // PrefetchRoute predicts tiles along a WGS84 route and submits them to a
@@ -80,22 +102,131 @@ func (s *Server) PrefetchRoute(ctx context.Context, route []RoutePoint, options 
 	if maxTiles == 0 {
 		maxTiles = s.prefetchMaxTiles
 	}
-	prefetcher := s.routePrefetcher()
-	if prefetcher == nil {
-		return PrefetchResult{}, ErrPredictiveCachingDisabled
-	}
 	keys, truncated, err := routeTileKeys(route, options.Zoom, options.Radius, maxTiles)
 	if err != nil {
 		return PrefetchResult{}, err
 	}
-	result := PrefetchResult{Considered: len(keys), Truncated: truncated}
+	return s.prefetchTiles(ctx, keys, truncated)
+}
+
+// PrefetchKeys queues an ordered TMS key list supplied by a trusted
+// application. It is useful for a map viewport, a search result cluster, or a
+// client prediction that has already determined the exact tiles it will need.
+// At most Config.PrefetchMaxTiles keys are considered, and duplicate or
+// already-warm payloads do not consume queue capacity. This is deliberately
+// not exposed as an unauthenticated HTTP endpoint: a caller decides which
+// prediction is trustworthy enough to spend cache memory on.
+func (s *Server) PrefetchKeys(ctx context.Context, keys []tiles.Key) (PrefetchResult, error) {
+	if s == nil || s.gen.Load().tileCache == nil {
+		return PrefetchResult{}, ErrPredictiveCachingDisabled
+	}
+	if err := ctx.Err(); err != nil {
+		return PrefetchResult{}, err
+	}
+	limit := s.prefetchMaxTiles
+	truncated := len(keys) > limit
+	if truncated {
+		keys = keys[:limit]
+	}
+	return s.prefetchTiles(ctx, keys, truncated)
+}
+
+// PrefetchRange queues the TMS tiles in a rectangular viewport. Like
+// PrefetchKeys, it is a trusted application API with the server's bounded
+// prefetch budget; it avoids allocating a tile list larger than that budget.
+// The iteration order is z/x/y, which gives callers predictable truncation
+// when a rectangle exceeds Config.PrefetchMaxTiles.
+func (s *Server) PrefetchRange(ctx context.Context, tileRange tiles.Range) (PrefetchResult, error) {
+	if s == nil || s.gen.Load().tileCache == nil {
+		return PrefetchResult{}, ErrPredictiveCachingDisabled
+	}
+	if err := ctx.Err(); err != nil {
+		return PrefetchResult{}, err
+	}
+	if err := tileRange.Validate(); err != nil {
+		return PrefetchResult{}, err
+	}
+	limit := s.prefetchMaxTiles
+	keys := make([]tiles.Key, 0, min(limit, 256))
+	for x := tileRange.XMin; x <= tileRange.XMax; x++ {
+		for y := tileRange.YMin; y <= tileRange.YMax; y++ {
+			if err := ctx.Err(); err != nil {
+				return PrefetchResult{Considered: len(keys)}, err
+			}
+			if len(keys) == limit {
+				return s.prefetchTiles(ctx, keys, true)
+			}
+			keys = append(keys, tiles.Key{Z: tileRange.Z, X: x, Y: y})
+		}
+	}
+	return s.prefetchTiles(ctx, keys, false)
+}
+
+// PrefetchXYZRange queues a browser-facing XYZ viewport. It preserves XYZ
+// north-to-south traversal order when work is truncated, while storing the
+// corresponding TMS keys in the predictive cache. Applications serving an
+// ordinary web map should prefer this over manually flipping y coordinates.
+func (s *Server) PrefetchXYZRange(ctx context.Context, tileRange XYZRange) (PrefetchResult, error) {
+	if s == nil || s.gen.Load().tileCache == nil {
+		return PrefetchResult{}, ErrPredictiveCachingDisabled
+	}
+	if err := ctx.Err(); err != nil {
+		return PrefetchResult{}, err
+	}
+	if err := tileRange.validate(); err != nil {
+		return PrefetchResult{}, err
+	}
+	limit := s.prefetchMaxTiles
+	keys := make([]tiles.Key, 0, min(limit, 256))
+	maxY := (1 << tileRange.Z) - 1
+	for x := tileRange.XMin; x <= tileRange.XMax; x++ {
+		for y := tileRange.YMin; y <= tileRange.YMax; y++ {
+			if err := ctx.Err(); err != nil {
+				return PrefetchResult{Considered: len(keys)}, err
+			}
+			if len(keys) == limit {
+				return s.prefetchTiles(ctx, keys, true)
+			}
+			keys = append(keys, tiles.Key{Z: tileRange.Z, X: x, Y: maxY - y})
+		}
+	}
+	return s.prefetchTiles(ctx, keys, false)
+}
+
+func (s *Server) prefetchTiles(ctx context.Context, keys []tiles.Key, truncated bool) (PrefetchResult, error) {
+	if s == nil || s.gen.Load().tileCache == nil {
+		return PrefetchResult{}, ErrPredictiveCachingDisabled
+	}
+	prefetcher := s.routePrefetcher()
+	if prefetcher == nil {
+		return PrefetchResult{}, ErrPredictiveCachingDisabled
+	}
+	gen := s.gen.Load()
+	result := PrefetchResult{Truncated: truncated}
+	seen := make(map[tiles.Key]struct{}, min(len(keys), 256))
 	for _, key := range keys {
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-		if prefetcher.enqueue(key) {
+		if err := key.Validate(); err != nil {
+			return result, err
+		}
+		result.Considered++
+		if _, duplicate := seen[key]; duplicate {
+			result.AlreadyQueued++
+			continue
+		}
+		seen[key] = struct{}{}
+		if _, _, cached := gen.tileCache.get(key); cached {
+			result.AlreadyCached++
+			continue
+		}
+		switch prefetcher.enqueue(key) {
+		case prefetchEnqueued:
 			result.Queued++
-		} else {
+		case prefetchAlreadyQueued:
+			result.AlreadyQueued++
+		default:
 			result.Dropped++
 		}
 	}
@@ -123,12 +254,21 @@ type tilePrefetcher struct {
 	stop   chan struct{}
 	done   sync.WaitGroup
 
-	mu     sync.Mutex
-	closed bool
+	mu      sync.Mutex
+	closed  bool
+	pending map[tiles.Key]struct{}
 }
 
+type prefetchEnqueueResult uint8
+
+const (
+	prefetchDropped prefetchEnqueueResult = iota
+	prefetchEnqueued
+	prefetchAlreadyQueued
+)
+
 func newTilePrefetcher(server *Server, workers, queue int) *tilePrefetcher {
-	prefetcher := &tilePrefetcher{server: server, jobs: make(chan tiles.Key, queue), stop: make(chan struct{})}
+	prefetcher := &tilePrefetcher{server: server, jobs: make(chan tiles.Key, queue), stop: make(chan struct{}), pending: make(map[tiles.Key]struct{}, queue)}
 	prefetcher.done.Add(workers)
 	for range workers {
 		go func() {
@@ -146,6 +286,7 @@ func newTilePrefetcher(server *Server, workers, queue int) *tilePrefetcher {
 				case key := <-prefetcher.jobs:
 					gen := prefetcher.server.gen.Load()
 					_, _, _, _ = prefetcher.server.lookupTile(context.Background(), gen, key)
+					prefetcher.complete(key)
 				}
 			}
 		}()
@@ -153,18 +294,28 @@ func newTilePrefetcher(server *Server, workers, queue int) *tilePrefetcher {
 	return prefetcher
 }
 
-func (p *tilePrefetcher) enqueue(key tiles.Key) bool {
+func (p *tilePrefetcher) enqueue(key tiles.Key) prefetchEnqueueResult {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
-		return false
+		return prefetchDropped
+	}
+	if _, pending := p.pending[key]; pending {
+		return prefetchAlreadyQueued
 	}
 	select {
 	case p.jobs <- key:
-		return true
+		p.pending[key] = struct{}{}
+		return prefetchEnqueued
 	default:
-		return false
+		return prefetchDropped
 	}
+}
+
+func (p *tilePrefetcher) complete(key tiles.Key) {
+	p.mu.Lock()
+	delete(p.pending, key)
+	p.mu.Unlock()
 }
 
 func (p *tilePrefetcher) close() {

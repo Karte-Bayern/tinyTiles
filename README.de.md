@@ -540,6 +540,12 @@ route := []server.RoutePoint{{Latitude: 48.14, Longitude: 11.58}, {Latitude: 48.
 _, err = tileServer.PrefetchRoute(context.Background(), route, server.RoutePrefetchOptions{
     Zoom: 14, Radius: 1,
 })
+
+// Viewports und anwendungseigene Vorhersagen verwenden dieselbe begrenzte,
+// deduplizierende Queue. Bereits warme Kacheln verbrauchen keine Queue-Kapazität.
+_, err = tileServer.PrefetchXYZRange(context.Background(), server.XYZRange{
+    Z: 14, XMin: 8600, XMax: 8602, YMin: 5530, YMax: 5532,
+})
 ```
 
 `Dataset.LookupTMS` und `Dataset.ScanTMS` arbeiten ausdrücklich mit TMS;

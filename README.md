@@ -495,6 +495,12 @@ route := []server.RoutePoint{{Latitude: 48.14, Longitude: 11.58}, {Latitude: 48.
 _, err = tileServer.PrefetchRoute(context.Background(), route, server.RoutePrefetchOptions{
     Zoom: 14, Radius: 1,
 })
+
+// Viewport and application-generated predictions use the same bounded,
+// de-duplicating queue. Existing warm tiles do not consume queue capacity.
+_, err = tileServer.PrefetchXYZRange(context.Background(), server.XYZRange{
+    Z: 14, XMin: 8600, XMax: 8602, YMin: 5530, YMax: 5532,
+})
 ```
 
 `Dataset.LookupTMS` and `Dataset.ScanTMS` are explicitly TMS; `LookupXYZ` and

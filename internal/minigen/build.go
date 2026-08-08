@@ -109,6 +109,9 @@ func Build(ctx context.Context, cfg Config) (Result, error) {
 		}
 		result.Tiles += written
 	}
+	if err := stream.Close(); err != nil {
+		return Result{}, fmt.Errorf("minigen: finalize tile stream: %w", err)
+	}
 	return result, nil
 }
 

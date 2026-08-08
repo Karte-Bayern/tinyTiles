@@ -1,6 +1,7 @@
 package minigen
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -17,7 +18,11 @@ type TileStream struct {
 	path     string
 	metadata map[string]string
 }
-type tileStreamWriter struct{ file *os.File }
+type tileStreamWriter struct {
+	file   *os.File
+	writer *bufio.Writer
+	closed bool
+}
 
 func createTileStream(path string, cfg Config, bounds Bounds) (*tileStreamWriter, error) {
 	f, err := os.Create(path)
@@ -33,21 +38,22 @@ func createTileStream(path string, cfg Config, bounds Bounds) (*tileStreamWriter
 		_ = f.Close()
 		return nil, fmt.Errorf("minigen: tile stream metadata too large")
 	}
-	if _, err := f.Write(tileStreamMagic[:]); err != nil {
+	writer := bufio.NewWriterSize(f, 256<<10)
+	if _, err := writer.Write(tileStreamMagic[:]); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
 	var size [4]byte
 	binary.BigEndian.PutUint32(size[:], uint32(len(metadata)))
-	if _, err := f.Write(size[:]); err != nil {
+	if _, err := writer.Write(size[:]); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
-	if _, err := f.Write(metadata); err != nil {
+	if _, err := writer.Write(metadata); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
-	return &tileStreamWriter{file: f}, nil
+	return &tileStreamWriter{file: f, writer: writer}, nil
 }
 func (w *tileStreamWriter) Write(z, x, y int, data []byte) error {
 	if z < 0 || z > 30 || x < 0 || y < 0 || len(data) > 64<<20 {
@@ -58,13 +64,23 @@ func (w *tileStreamWriter) Write(z, x, y int, data []byte) error {
 	binary.BigEndian.PutUint32(head[1:5], uint32(x))
 	binary.BigEndian.PutUint32(head[5:9], uint32(y))
 	binary.BigEndian.PutUint64(head[9:17], uint64(len(data)))
-	if _, err := w.file.Write(head[:]); err != nil {
+	if _, err := w.writer.Write(head[:]); err != nil {
 		return err
 	}
-	_, err := w.file.Write(data)
+	_, err := w.writer.Write(data)
 	return err
 }
-func (w *tileStreamWriter) Close() error { return w.file.Close() }
+func (w *tileStreamWriter) Close() error {
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	if err := w.writer.Flush(); err != nil {
+		_ = w.file.Close()
+		return err
+	}
+	return w.file.Close()
+}
 
 func OpenTileStream(path string) (*TileStream, error) {
 	f, err := os.Open(path)

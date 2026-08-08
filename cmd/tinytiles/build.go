@@ -165,7 +165,7 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "generator=tinytiles-minimal")
 		result, err := minigen.Build(ctx, minigen.Config{
 			PBFInputs:   pbfInputs,
-			MBTiles:     mbtiles,
+			Output:      mbtiles,
 			MinZoom:     *minZoom,
 			MaxZoom:     *maxZoom,
 			Concurrency: *concurrency,

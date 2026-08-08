@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/SimonWaldherr/tinySQL/importer"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
-	_ "modernc.org/sqlite"
 )
 
 const (

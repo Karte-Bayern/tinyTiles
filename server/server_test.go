@@ -14,8 +14,8 @@ import (
 
 	tinytiles "github.com/Karte-Bayern/tinyTiles"
 	"github.com/Karte-Bayern/tinyTiles/offline"
+	_ "github.com/SimonWaldherr/tinySQL/importer"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
-	_ "modernc.org/sqlite"
 )
 
 func testServer(t *testing.T) *Server {

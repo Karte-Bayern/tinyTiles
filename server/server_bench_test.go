@@ -11,8 +11,8 @@ import (
 	"testing"
 
 	tinytiles "github.com/Karte-Bayern/tinyTiles"
+	_ "github.com/SimonWaldherr/tinySQL/importer"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
-	_ "modernc.org/sqlite"
 )
 
 func BenchmarkXYZHandlerWarmTile(b *testing.B) {

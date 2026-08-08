@@ -19,8 +19,8 @@ import (
 const fakePreprocessEnv = "TINYTILES_FAKE_PREPROCESS"
 
 // The build command starts a separate executable. Re-executing this test
-// binary gives the integration test a portable fake Karte preprocessor without
-// depending on sqlite3, a shell, or a Karte.Bayern checkout at test time.
+// binary gives the integration test a portable fake external generator without
+// depending on sqlite3 or a shell at test time.
 func init() {
 	if os.Getenv(fakePreprocessEnv) != "1" {
 		return
@@ -62,8 +62,8 @@ func fakePreprocess(args []string) error {
 	return err
 }
 
-func TestKartePreprocessOptionsArgs(t *testing.T) {
-	options := kartePreprocessOptions{
+func TestExternalGeneratorOptionsArgs(t *testing.T) {
+	options := externalGeneratorOptions{
 		PBFInputs:         []string{"first.osm.pbf", "second.osm.pbf"},
 		MBTiles:           "/tmp/source.mbtiles",
 		ShardDir:          "/tmp/shards",
@@ -109,8 +109,8 @@ func TestKartePreprocessOptionsArgs(t *testing.T) {
 	}
 }
 
-func TestKartePreprocessOptionsShardCompression(t *testing.T) {
-	options := kartePreprocessOptions{
+func TestExternalGeneratorOptionsShardCompression(t *testing.T) {
+	options := externalGeneratorOptions{
 		PBFInputs:           []string{"source.osm.pbf"},
 		MBTiles:             "/tmp/source.mbtiles",
 		ShardDir:            "/tmp/shards",
@@ -129,12 +129,27 @@ func TestKartePreprocessOptionsShardCompression(t *testing.T) {
 	t.Fatalf("generator args did not disable shard compression: %#v", options.args())
 }
 
-func TestKartePreprocessOptionsValidate(t *testing.T) {
-	valid := kartePreprocessOptions{PBFInputs: []string{"source.osm.pbf"}, MinZoom: 5, MaxZoom: 14, BuildingMinZoom: 12, Shards: 1}
+func TestBuiltinProvenanceIdentifiesMinimalGenerator(t *testing.T) {
+	pbf := filepath.Join(t.TempDir(), "region.osm.pbf")
+	if err := os.WriteFile(pbf, []byte("pbf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := (externalGeneratorOptions{PBFInputs: []string{pbf}, MinZoom: 5, MaxZoom: 14}).builtinProvenance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	generator, ok := provenance["generator"].(map[string]any)
+	if !ok || generator["adapter"] != "tinytiles-minimal" || generator["executable"] != "builtin" {
+		t.Fatalf("generator provenance = %#v", provenance["generator"])
+	}
+}
+
+func TestExternalGeneratorOptionsValidate(t *testing.T) {
+	valid := externalGeneratorOptions{PBFInputs: []string{"source.osm.pbf"}, MinZoom: 5, MaxZoom: 14, BuildingMinZoom: 12, Shards: 1}
 	if err := valid.validate(); err != nil {
 		t.Fatalf("valid options rejected: %v", err)
 	}
-	cases := []kartePreprocessOptions{
+	cases := []externalGeneratorOptions{
 		{PBFInputs: []string{"source.osm.pbf"}, MinZoom: 14, MaxZoom: 5, BuildingMinZoom: 12, Shards: 1},
 		{PBFInputs: []string{"source.osm.pbf"}, MinZoom: 5, MaxZoom: 14, BuildingMinZoom: 23, Shards: 1},
 		{PBFInputs: []string{"source.osm.pbf"}, MinZoom: 5, MaxZoom: 14, BuildingMinZoom: 12, Shards: 0},
@@ -147,8 +162,8 @@ func TestKartePreprocessOptionsValidate(t *testing.T) {
 	}
 }
 
-func TestKartePreprocessOptionsRadiusRequiresExplicitCenter(t *testing.T) {
-	base := kartePreprocessOptions{
+func TestExternalGeneratorOptionsRadiusRequiresExplicitCenter(t *testing.T) {
+	base := externalGeneratorOptions{
 		PBFInputs:       []string{"source.osm.pbf"},
 		MinZoom:         5,
 		MaxZoom:         14,

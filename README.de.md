@@ -21,8 +21,9 @@ ohne SQLite sinnvoll ist.
 - exakte TMS-Punkt- und Bereichsabfragen über die öffentliche tinySQL-API;
 - atomare Veröffentlichung von `.ttiles` und vollständige Prüfung nach dem
   Schreiben;
-- direkte OSM-PBF → MBTiles → `.ttiles`-Orchestrierung über einen expliziten,
-  mit Karte.Bayern kompatiblen Generator-Adapter;
+- selbstständige OSM-PBF → MBTiles → `.ttiles`-Erzeugung mit einer kompakten,
+  straßenorientierten Vektorschicht; reichhaltigere kompatible Erzeuger bleiben
+  optional;
 - ein importierbares, nebenläufiges `Dataset`, ein einhängbarer HTTP-Server
   und ein kleines eigenständiges Serverprogramm mit automatischer Ableitung von
   Vektor-/Raster-MIME-Typen und URL-Endungen sowie dauerhaften Caches für
@@ -39,8 +40,8 @@ schnellen, validierten Lesepfad bekommt, sobald man es bereits hat.
 - **[OpenStreetMap](https://www.openstreetmap.org)** ist die von der
   Community gepflegte Quelldaten hinter den meisten Kachelsätzen, die
   tinyTiles ausliefert. `tinytiles build` verarbeitet dessen `.osm.pbf`-
-  Exportformat direkt, über einen expliziten Generator-Adapter — siehe
-  [PBF-Build-Adapter](#pbf-build-adapter).
+  Exportformat direkt mit dem eingebauten Minimal-Erzeuger — siehe
+  [PBF-Build](#pbf-build).
 - **[Geofabrik](https://download.geofabrik.de)** veröffentlicht täglich
   aktualisierte `.osm.pbf`-Extrakte für jedes Land und viele Teilregionen und
   ist die Standardquelle für eine `tinytiles build`-Eingabe. Interne
@@ -94,27 +95,29 @@ Die Befehle `validate`, `inspect` und `tile` funktionieren ohne SQLite.
 `build`, `import` und `benchmark` geben dort absichtlich einen eindeutigen
 Build-Tag-Fehler zurück.
 
-Wenn ein kompatibler Generator vorhanden ist, kann direkt aus PBF gebaut
-werden:
+Eine Offline-Straßenkarte lässt sich direkt aus PBF bauen:
 
 ```bash
 ./dist/tinytiles build \
-  --generator /path/to/karte-preprocess \
-  --minzoom 8 --maxzoom 14 --building-minzoom 12 \
-  --shards 256 --max-memory $((256 * 1024 * 1024)) \
+  --minzoom 8 --maxzoom 14 \
+  --max-memory $((256 * 1024 * 1024)) \
   region.osm.pbf region.ttiles/
 ```
 
-`build` erfindet keinen Kartenstil. Der externe Generator bestimmt
-OSM-Objektauswahl, Stil und MVT-Layer-Semantik; tinyTiles verantwortet den
-begrenzten Import, den Artefaktvertrag sowie den Leser- und Cache-Pfad.
+Der eingebaute Erzeuger schreibt die MVT-Schichten `transportation` (große
+Straßen, Straßen und Wege), `building`, `water` und `landcover` (Wald, Felder,
+Wiesen und Obst-/Weinanbau). Er enthält absichtlich keine Luftbilder, POIs oder
+Beschriftungen; ein lokaler MapLibre-Stil rendert die Schichten. Für sehr große
+Extrakte oder einen reichhaltigeren Kachelsatz kann `--generator` weiterhin
+explizit auf ein kompatibles lokales Programm verweisen.
 
-Temporäre Generator-Shards bleiben standardmäßig komprimiert, um den
-Arbeitsbereich auf dem Datenträger zu begrenzen. Auf einer schnellen lokalen
-SSD mit ausreichend temporärem Platz kann `--shard-compression=false`
-verwendet werden, um diesen Speicherplatz gegen eine schnellere
-PBF-Erzeugung einzutauschen; die Wahl wird in der Herkunft des veröffentlichten
-Artefakts festgehalten.
+Die kompakte erste Version verarbeitet dafür geschlossene OSM-Wege. Komplexe
+Multipolygon-Relationen bleiben bewusst dem optionalen reichhaltigeren
+Erzeuger vorbehalten.
+
+Die Flags `--building-minzoom`, `--shards`, `--shard-compression`,
+`--reduce-concurrency`, `--districts` sowie die geografischen Filter gelten
+nur für einen explizit gewählten externen Erzeuger.
 
 Dasselbe Flag `--compact` steht bei `tinytiles build` zur Verfügung; es
 dedupliziert die erzeugten MBTiles nur für den abschließenden `.ttiles`-Import
@@ -441,19 +444,20 @@ Bei direkten Imports wird der angeforderte Batch automatisch verkleinert, wenn
 die größte Quellkachel sonst `--max-memory` überschreiten würde; die CLI meldet
 den aufgelösten Wert als `batch-adjustment`.
 
-### PBF-Build-Adapter
+### PBF-Build
 
-`tinytiles build` ruft ein externes Programm auf; standardmäßig
-`karte-preprocess`. Karte.Bayerns Preprocessor kann einmal gebaut oder über
-`--generator` auf ein kompatibles Programm verwiesen werden:
+`tinytiles build` ist standardmäßig eigenständig. Es sammelt zunächst die
+Knoten-IDs der darstellbaren Straßen, lädt nur deren Koordinaten und verarbeitet
+die Straßen anschließend je Zoomstufe zu Vector-MBTiles. Dafür sind weder ein
+weiteres Binary, ein anderes Repository noch ein Netzdienst erforderlich.
+
+Für einen reichhaltigeren lokalen Kachelsatz bleibt `--generator` ein
+expliziter Override. Das Programm muss die angeforderten MBTiles über einen
+kompatiblen CLI-Vertrag schreiben:
 
 ```bash
-cd /path/to/Karte.Bayern
-go build -o /path/to/bin/karte-preprocess ./cmd/preprocess
-
-cd /path/to/tinyTiles
 ./dist/tinytiles build \
-  --generator /path/to/bin/karte-preprocess \
+  --generator /path/to/custom-preprocess \
   --mbtiles-out region.mbtiles \
   --replace-mbtiles --replace \
   region.osm.pbf region.ttiles/
@@ -461,8 +465,8 @@ cd /path/to/tinyTiles
 
 Mehrere PBF-Dateien werden durch Kommata getrennt. `--min-lat`, `--min-lon`,
 `--max-lat`, `--max-lon`, `--center-lat`, `--center-lon` und
-`--radius-km` werden bewusst als explizite Karte.Bayern-Adapteroptionen
-durchgereicht. Das mit Prüfsummen versehene Artefaktmanifest hält portable
+`--radius-km` werden nur an einen expliziten externen Erzeuger durchgereicht.
+Das mit Prüfsummen versehene Artefaktmanifest hält portable
 PBF-Herkunft fest (Eingabedateinamen/-größen und Generator-Konfiguration), nie
 maschinenlokale absolute Pfade.
 
@@ -515,7 +519,7 @@ dataset, err := tinytiles.Open(context.Background(), "region.ttiles", tinytiles.
 if err != nil { /* Startfehler behandeln */ }
 defer dataset.Close()
 
-// Direkter Ersatz für Karte.Bayerns vorhandenes tileReader-Interface:
+// Direkter Ersatz für vorhandene tileReader-Interfaces:
 // GetTileXYZ(z, x, y) ([]byte, error), Metadata() (map[string]string, error), Close() error.
 var tiles interface {
     GetTileXYZ(int, int, int) ([]byte, error)
@@ -555,7 +559,7 @@ kopiert, sodass gewöhnliche Anfragen keine Metadatentabelle durchsuchen. Ein
 fehlgeschlagenes `GetTileXYZ` gibt `tinytiles.ErrTileNotFound` zurück, was
 mit `sql.ErrNoRows` kompatibel ist.
 
-Karte.Bayern kann daher nur den Öffnungspfad durch `tinytiles.Open` ersetzen
+Anwendungen können daher nur den Öffnungspfad durch `tinytiles.Open` ersetzen
 und den vorhandenen Cache, TileJSON und die Handler-Strategie behalten. Zur
 Auslieferungszeit sind weder ein internes tinySQL-Paket, ein SQLite-Treiber
 noch eine Produktionskonfiguration erforderlich.

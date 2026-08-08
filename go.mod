@@ -2,10 +2,7 @@ module github.com/Karte-Bayern/tinyTiles
 
 go 1.26.5
 
-require (
-	github.com/SimonWaldherr/tinySQL v0.30.0
-	modernc.org/sqlite v1.56.0
-)
+require github.com/SimonWaldherr/tinySQL v0.30.0
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -22,4 +19,5 @@ require (
 	modernc.org/libc v1.75.2 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.0 // indirect
+	modernc.org/sqlite v1.56.0 // indirect
 )

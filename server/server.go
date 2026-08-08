@@ -370,8 +370,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 // XYZHandler serves bare z/x/y[.<format>] paths. This makes it safe to mount in an
-// existing service with http.StripPrefix("/tiles/", handler), which is the
-// integration shape used by Karte.Bayern-style application servers.
+// existing service with http.StripPrefix("/tiles/", handler).
 func (s *Server) XYZHandler() http.Handler {
 	return http.HandlerFunc(s.serveXYZ)
 }

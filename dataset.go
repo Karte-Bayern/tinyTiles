@@ -67,9 +67,8 @@ type Dataset struct {
 	inFlight sync.WaitGroup
 }
 
-// Keep the narrow application-reader contract compile-checked. It is the
-// shape used by Karte.Bayern and other servers that intentionally own their
-// HTTP cache and presentation policy outside tinyTiles.
+// Keep the narrow application-reader contract compile-checked. It lets calling
+// servers own their HTTP cache and presentation policy outside tinyTiles.
 var _ interface {
 	GetTileXYZ(z, x, yXYZ int) ([]byte, error)
 	Metadata() (map[string]string, error)

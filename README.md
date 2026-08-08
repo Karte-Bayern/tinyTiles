@@ -17,8 +17,8 @@ validated, SQLite-free read path is useful.
 - bounded MBTiles import for flat `tiles` and normalized `map/images` sources;
 - exact TMS point and spatial-range reads through tinySQL's public API;
 - atomic `.ttiles` publication and full post-write validation;
-- direct OSM PBF → MBTiles → `.ttiles` orchestration through an explicit
-  Karte.Bayern-compatible generator adapter;
+- self-contained OSM PBF → MBTiles → `.ttiles` generation with a compact,
+  road-focused vector layer; richer compatible generators remain optional;
 - an importable concurrent `Dataset`, a mountable HTTP server and a small
   standalone server binary with automatic vector/raster MIME and URL-extension
   inference, plus durable native and browser IndexedDB caches;
@@ -32,8 +32,8 @@ path once you already have it.
 
 - **[OpenStreetMap](https://www.openstreetmap.org)** is the community-
   maintained source data behind most tile sets tinyTiles serves. `tinytiles
-  build` consumes its `.osm.pbf` export format directly, through an explicit
-  generator adapter — see [PBF build adapter](#pbf-build-adapter).
+  build` consumes its `.osm.pbf` export format directly with its built-in
+  minimal generator — see [PBF build](#pbf-build).
 - **[Geofabrik](https://download.geofabrik.de)** publishes daily-updated
   `.osm.pbf` extracts for every country and many sub-regions, and is the
   standard source for a `tinytiles build` input. Internal reader benchmarks
@@ -81,19 +81,20 @@ make build-reader-cli
 Its `validate`, `inspect` and `tile` commands work without SQLite. `build`,
 `import` and `benchmark` intentionally return a clear build-tag error there.
 
-Build from PBF when a compatible generator is available:
+Build an offline road map directly from PBF:
 
 ```bash
 ./dist/tinytiles build \
-  --generator /path/to/karte-preprocess \
-  --minzoom 8 --maxzoom 14 --building-minzoom 12 \
-  --shards 256 --max-memory $((256 * 1024 * 1024)) \
+  --minzoom 8 --maxzoom 14 \
+  --max-memory $((256 * 1024 * 1024)) \
   region.osm.pbf region.ttiles/
 ```
 
-`build` does not invent a map style. The external generator owns OSM feature
-selection, styling and MVT layer semantics; tinyTiles owns the bounded import,
-artifact contract and reader/cache path.
+The built-in generator emits one `transportation` MVT layer with major roads,
+streets and paths. It intentionally does not claim to be a full cartographic
+style: it has no aerial imagery, land-use polygons, buildings, POIs or labels.
+Use a local MapLibre style to draw the layer. An external compatible generator
+can still be selected with `--generator` when a richer tileset is wanted.
 
 Temporary generator shards stay compressed by default to limit workspace disk.
 On a fast local SSD with sufficient temporary capacity, pass
@@ -402,29 +403,35 @@ For direct imports, the requested batch is automatically reduced when the
 largest source tile would otherwise exceed `--max-memory`; the CLI reports the
 resolved value as `batch-adjustment`.
 
-### PBF build adapter
+### PBF build
 
-`tinytiles build` invokes an external executable, defaulting to
-`karte-preprocess`. Build Karte.Bayern's preprocessor once, or point
-`--generator` at a compatible executable:
+`tinytiles build` is self-contained by default. It collects renderable way node
+IDs and loads only those coordinates, then streams the features once for each
+requested zoom into a vector MBTiles source before importing the immutable
+artifact. The built-in tileset contains transportation, building, water and
+landcover layers. No other project's binary, repository or network service is
+used.
+
+This compact first version renders closed OSM ways; complex multipolygon
+relations intentionally remain the responsibility of an optional richer
+generator.
+
+For a richer local tileset, `--generator` remains an explicit override. It
+must write the requested MBTiles file using the compatible command-line flags:
 
 ```bash
-cd /path/to/Karte.Bayern
-go build -o /path/to/bin/karte-preprocess ./cmd/preprocess
-
-cd /path/to/tinyTiles
 ./dist/tinytiles build \
-  --generator /path/to/bin/karte-preprocess \
+  --generator /path/to/custom-preprocess \
   --mbtiles-out region.mbtiles \
   --replace-mbtiles --replace \
   region.osm.pbf region.ttiles/
 ```
 
 Multiple PBF files are comma-separated. `--min-lat`, `--min-lon`, `--max-lat`,
-`--max-lon`, `--center-lat`, `--center-lon` and `--radius-km` are deliberately
-passed through as explicit Karte.Bayern adapter options. The checksummed
-artifact manifest records portable PBF provenance (input basenames/sizes and
-generator configuration), never machine-local absolute paths.
+`--max-lon`, `--center-lat`, `--center-lon` and `--radius-km` are passed to an
+external generator only. The checksummed artifact manifest records portable
+PBF provenance (input basenames/sizes and generator configuration), never
+machine-local absolute paths.
 
 ## `.ttiles` artifact contract
 
@@ -472,7 +479,7 @@ dataset, err := tinytiles.Open(context.Background(), "region.ttiles", tinytiles.
 if err != nil { /* fail startup */ }
 defer dataset.Close()
 
-// Direct drop-in for Karte.Bayern's existing tileReader interface:
+// Direct drop-in for an existing tileReader interface:
 // GetTileXYZ(z, x, y) ([]byte, error), Metadata() (map[string]string, error), Close() error.
 var tiles interface {
     GetTileXYZ(int, int, int) ([]byte, error)
@@ -509,8 +516,8 @@ boundary. `Metadata` is read and copied at open time, so ordinary requests do
 not scan a metadata table. A missing `GetTileXYZ` lookup returns
 `tinytiles.ErrTileNotFound`, which is compatible with `sql.ErrNoRows`.
 
-Karte.Bayern can therefore replace only the opening path with `tinytiles.Open`
-and keep its existing cache, TileJSON and handler policy. No tinySQL internal
+Applications can therefore replace only the opening path with `tinytiles.Open`
+and keep their existing cache, TileJSON and handler policy. No tinySQL internal
 package, SQLite driver or production configuration is required at serving
 time.
 

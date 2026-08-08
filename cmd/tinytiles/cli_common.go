@@ -61,7 +61,7 @@ Usage:
   tinytiles version
 
 Commands:
-  build      run a configured PBF→MBTiles generator, then import and publish
+  build      generate a minimal PBF road tileset, then import and publish
   import     build and atomically publish a bounded read artifact
   validate   run the complete checksum, table, index and tile-digest audit
   inspect    print the published semantic artifact information as JSON

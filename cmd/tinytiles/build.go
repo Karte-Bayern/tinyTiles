@@ -15,36 +15,36 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Karte-Bayern/tinyTiles/internal/minigen"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
 
-// commandBuild provides a one-command PBF-to-tinyTiles path without baking a
-// map style or OSM feature policy into this repository. The configured
-// generator owns PBF interpretation; Karte.Bayern's preprocess binary is the
-// first supported generator adapter.
+// commandBuild provides a self-contained PBF-to-tinyTiles path. Its default
+// generator deliberately produces only a compact transportation layer; users
+// with a richer, compatible renderer can still select it explicitly.
 func commandBuild(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("build", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	generator := fs.String("generator", "karte-preprocess", "Karte.Bayern-compatible PBF→MBTiles generator executable")
+	generator := fs.String("generator", "", "optional compatible PBF→MBTiles generator executable (empty uses built-in minimal generator)")
 	mbtilesOut := fs.String("mbtiles-out", "", "persist the generated MBTiles at this path")
 	replaceMBTiles := fs.Bool("replace-mbtiles", false, "allow replacement of an existing --mbtiles-out file")
 	workDir := fs.String("work-dir", "", "parent directory for temporary MBTiles and shards")
 	keepWork := fs.Bool("keep-work", false, "keep temporary source MBTiles and generator files for inspection")
 	minZoom := fs.Int("minzoom", 5, "minimum tile zoom")
 	maxZoom := fs.Int("maxzoom", 14, "maximum tile zoom")
-	buildingMinZoom := fs.Int("building-minzoom", 12, "minimum building zoom")
-	shards := fs.Int("shards", 256, "temporary generator shard count")
-	shardCompression := fs.Bool("shard-compression", true, "compress temporary generator shards; disable for faster builds with more temporary disk")
+	buildingMinZoom := fs.Int("building-minzoom", 12, "external generator only: minimum building zoom")
+	shards := fs.Int("shards", 256, "external generator only: temporary generator shard count")
+	shardCompression := fs.Bool("shard-compression", true, "external generator only: compress temporary generator shards")
 	concurrency := fs.Int("concurrency", 0, "generator decode concurrency; 0 uses its default")
-	reduceConcurrency := fs.Int("reduce-concurrency", 0, "generator reduce concurrency; 0 uses its default")
-	districts := fs.String("districts", "", "optional district-boundary GeoJSON")
-	minLat := fs.Float64("min-lat", 0, "optional geographic filter: southern latitude")
-	minLon := fs.Float64("min-lon", 0, "optional geographic filter: western longitude")
-	maxLat := fs.Float64("max-lat", 0, "optional geographic filter: northern latitude")
-	maxLon := fs.Float64("max-lon", 0, "optional geographic filter: eastern longitude")
-	centerLat := fs.Float64("center-lat", 0, "optional radius-filter center latitude")
-	centerLon := fs.Float64("center-lon", 0, "optional radius-filter center longitude")
-	radiusKM := fs.Float64("radius-km", 0, "optional radius filter in kilometres")
+	reduceConcurrency := fs.Int("reduce-concurrency", 0, "external generator only: reduce concurrency")
+	districts := fs.String("districts", "", "external generator only: optional district-boundary GeoJSON")
+	minLat := fs.Float64("min-lat", 0, "external generator only: southern latitude filter")
+	minLon := fs.Float64("min-lon", 0, "external generator only: western longitude filter")
+	maxLat := fs.Float64("max-lat", 0, "external generator only: northern latitude filter")
+	maxLon := fs.Float64("max-lon", 0, "external generator only: eastern longitude filter")
+	centerLat := fs.Float64("center-lat", 0, "external generator only: radius center latitude")
+	centerLon := fs.Float64("center-lon", 0, "external generator only: radius center longitude")
+	radiusKM := fs.Float64("radius-km", 0, "external generator only: radius in kilometres")
 	schema := fs.String("schema", "auto", "artifact schema: auto, flat, normalized")
 	compact := fs.Bool("compact", false, "losslessly deduplicate equal tile payloads into a normalized artifact (uses temporary disk)")
 	batch := fs.Int("batch", defaultImportBatchSize, "rows per bounded artifact import batch; 0 enables automatic tuning within the memory limit")
@@ -61,7 +61,7 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tinytiles build: %v\n", err)
 		return 2
 	}
-	options := kartePreprocessOptions{
+	options := externalGeneratorOptions{
 		PBFInputs:           pbfInputs,
 		MinZoom:             *minZoom,
 		MaxZoom:             *maxZoom,
@@ -114,11 +114,6 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	generatorPath, err := exec.LookPath(strings.TrimSpace(*generator))
-	if err != nil {
-		fmt.Fprintf(stderr, "tinytiles build: generator %q not found: %v\n", *generator, err)
-		return 2
-	}
 	if *mbtilesOut != "" {
 		if err := validatePersistentBuildPaths(*mbtilesOut, fs.Arg(1), pbfInputs, *districts); err != nil {
 			fmt.Fprintf(stderr, "tinytiles build: %v\n", err)
@@ -161,26 +156,49 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	}
 	options.MBTiles = mbtiles
 	options.ShardDir = filepath.Join(work, "shards")
-	generatorArgs := options.args()
-	provenance, err := options.provenance(generatorPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "tinytiles build: collect PBF provenance: %v\n", err)
-		return 1
-	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	command := exec.CommandContext(ctx, generatorPath, generatorArgs...)
-	command.Stdout, command.Stderr = stdout, stderr
 	fmt.Fprintln(stdout, "phase=generate")
-	fmt.Fprintf(stdout, "generator=%s\n", generatorPath)
-	fmt.Fprintf(stdout, "generator-args=%s\n", quoteArguments(generatorArgs))
-	if err := command.Run(); err != nil {
-		if ctx.Err() != nil {
-			fmt.Fprintf(stderr, "tinytiles build: generation cancelled: %v\n", ctx.Err())
-		} else {
-			fmt.Fprintf(stderr, "tinytiles build: generator failed: %v\n", err)
+	var provenance map[string]any
+	if generatorName := strings.TrimSpace(*generator); generatorName == "" {
+		fmt.Fprintln(stdout, "generator=tinytiles-minimal")
+		result, err := minigen.Build(ctx, minigen.Config{
+			PBFInputs:   pbfInputs,
+			MBTiles:     mbtiles,
+			MinZoom:     *minZoom,
+			MaxZoom:     *maxZoom,
+			Concurrency: *concurrency,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "tinytiles build: built-in generation failed: %v\n", err)
+			return 1
 		}
+		fmt.Fprintf(stdout, "road-features=%d tiles=%d bounds=%s\n", result.Roads, result.Tiles, result.Bounds.String())
+		provenance, err = options.builtinProvenance()
+	} else {
+		generatorPath, lookupErr := exec.LookPath(generatorName)
+		if lookupErr != nil {
+			fmt.Fprintf(stderr, "tinytiles build: generator %q not found: %v\n", generatorName, lookupErr)
+			return 2
+		}
+		generatorArgs := options.args()
+		fmt.Fprintf(stdout, "generator=%s\n", generatorPath)
+		fmt.Fprintf(stdout, "generator-args=%s\n", quoteArguments(generatorArgs))
+		command := exec.CommandContext(ctx, generatorPath, generatorArgs...)
+		command.Stdout, command.Stderr = stdout, stderr
+		if err := command.Run(); err != nil {
+			if ctx.Err() != nil {
+				fmt.Fprintf(stderr, "tinytiles build: generation cancelled: %v\n", ctx.Err())
+			} else {
+				fmt.Fprintf(stderr, "tinytiles build: generator failed: %v\n", err)
+			}
+			return 1
+		}
+		provenance, err = options.provenance(generatorPath)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "tinytiles build: collect PBF provenance: %v\n", err)
 		return 1
 	}
 	if err := requireRegularFile("generated MBTiles", mbtiles); err != nil {
@@ -201,10 +219,34 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// kartePreprocessOptions mirrors the documented, stable flags of
-// Karte.Bayern cmd/preprocess. Keeping the adapter explicit prevents tinyTiles
-// from claiming that all PBF renderers share the same map semantics.
-type kartePreprocessOptions struct {
+func (o externalGeneratorOptions) builtinProvenance() (map[string]any, error) {
+	inputs := make([]map[string]any, 0, len(o.PBFInputs))
+	for _, input := range o.PBFInputs {
+		info, err := os.Stat(input)
+		if err != nil {
+			return nil, fmt.Errorf("stat PBF input %q: %w", input, err)
+		}
+		inputs = append(inputs, map[string]any{"name": filepath.Base(input), "bytes": info.Size()})
+	}
+	return map[string]any{
+		"kind":       "osm-pbf",
+		"pbf_inputs": inputs,
+		"generator": map[string]any{
+			"adapter":    "tinytiles-minimal",
+			"executable": "builtin",
+		},
+		"generator_config": map[string]any{
+			"minzoom": o.MinZoom,
+			"maxzoom": o.MaxZoom,
+			"layer":   "transportation",
+		},
+	}, nil
+}
+
+// externalGeneratorOptions contains the stable CLI contract for an optional
+// PBF-to-MBTiles generator. The built-in generator deliberately implements only
+// the small road-basemap subset; external generators may offer richer styles.
+type externalGeneratorOptions struct {
 	PBFInputs                                 []string
 	MBTiles, ShardDir, Districts              string
 	MinZoom, MaxZoom, BuildingMinZoom, Shards int
@@ -215,7 +257,7 @@ type kartePreprocessOptions struct {
 	CenterLatSet, CenterLonSet                bool
 }
 
-func (o kartePreprocessOptions) validate() error {
+func (o externalGeneratorOptions) validate() error {
 	if len(o.PBFInputs) == 0 {
 		return fmt.Errorf("at least one PBF input is required")
 	}
@@ -258,7 +300,7 @@ func (o kartePreprocessOptions) validate() error {
 	return nil
 }
 
-func (o kartePreprocessOptions) args() []string {
+func (o externalGeneratorOptions) args() []string {
 	args := []string{
 		"-pbf", strings.Join(o.PBFInputs, ","),
 		"-out", o.MBTiles,
@@ -295,7 +337,7 @@ func (o kartePreprocessOptions) args() []string {
 	return args
 }
 
-func (o kartePreprocessOptions) provenance(generatorPath string) (map[string]any, error) {
+func (o externalGeneratorOptions) provenance(generatorPath string) (map[string]any, error) {
 	inputs := make([]map[string]any, 0, len(o.PBFInputs))
 	for _, input := range o.PBFInputs {
 		info, err := os.Stat(input)
@@ -333,7 +375,7 @@ func (o kartePreprocessOptions) provenance(generatorPath string) (map[string]any
 		"kind":       "osm-pbf",
 		"pbf_inputs": inputs,
 		"generator": map[string]any{
-			"adapter":    "karte-bayern-preprocess",
+			"adapter":    "external-generator",
 			"executable": filepath.Base(generatorPath),
 		},
 		"generator_config": config,
@@ -343,7 +385,7 @@ func (o kartePreprocessOptions) provenance(generatorPath string) (map[string]any
 // shardCompressionEnabled preserves the historical adapter default for the
 // zero value used by tests and internal helpers. commandBuild sets the marker
 // so an explicit --shard-compression=false is propagated unchanged.
-func (o kartePreprocessOptions) shardCompressionEnabled() bool {
+func (o externalGeneratorOptions) shardCompressionEnabled() bool {
 	return !o.ShardCompressionSet || o.ShardCompression
 }
 

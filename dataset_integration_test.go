@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	_ "github.com/SimonWaldherr/tinySQL/importer"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
-	_ "modernc.org/sqlite"
 )
 
 func testDataset(t *testing.T) *Dataset {

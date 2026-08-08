@@ -26,8 +26,8 @@ import (
 	"sync"
 	"time"
 
-	tinytiles "github.com/Karte-Bayern/tinyTiles"
-	"github.com/Karte-Bayern/tinyTiles/internal/pmtiles"
+	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
+	"github.com/Karte-Bayern/tinyTiles/v2/internal/pmtiles"
 	_ "github.com/SimonWaldherr/tinySQL/importer"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )

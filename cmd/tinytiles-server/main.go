@@ -18,8 +18,8 @@ import (
 	"syscall"
 	"time"
 
-	tinytiles "github.com/Karte-Bayern/tinyTiles"
-	"github.com/Karte-Bayern/tinyTiles/server"
+	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
+	"github.com/Karte-Bayern/tinyTiles/v2/server"
 )
 
 // version is replaced with a SemVer tag by the release build. It is exposed

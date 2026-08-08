@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	tinytiles "github.com/Karte-Bayern/tinyTiles"
-	"github.com/Karte-Bayern/tinyTiles/offline"
+	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
+	"github.com/Karte-Bayern/tinyTiles/v2/offline"
 	_ "github.com/SimonWaldherr/tinySQL/importer"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
@@ -209,6 +209,95 @@ func TestHandlerTileJSONAndConditionalResponses(t *testing.T) {
 	}
 }
 
+func TestMountedHandlerAdvertisesMountPath(t *testing.T) {
+	server, err := New(Config{Dataset: testDataset(t), DatasetID: "fixture", MountPath: "/tinytiles"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	mux := http.NewServeMux()
+	mux.Handle("/tinytiles/", http.StripPrefix("/tinytiles", server.Handler()))
+	tileJSONResponse := httptest.NewRecorder()
+	mux.ServeHTTP(tileJSONResponse, httptest.NewRequest(http.MethodGet, "https://maps.example/tinytiles/tilejson.json", nil))
+	if tileJSONResponse.Code != http.StatusOK {
+		t.Fatalf("mounted TileJSON status = %d: %s", tileJSONResponse.Code, tileJSONResponse.Body.String())
+	}
+	var tileJSON map[string]any
+	if err := json.Unmarshal(tileJSONResponse.Body.Bytes(), &tileJSON); err != nil {
+		t.Fatal(err)
+	}
+	tileURLs, ok := tileJSON["tiles"].([]any)
+	if !ok || len(tileURLs) != 1 {
+		t.Fatalf("mounted TileJSON tiles = %#v", tileJSON["tiles"])
+	}
+	tileURL, ok := tileURLs[0].(string)
+	if !ok || !strings.HasPrefix(tileURL, "https://maps.example/tinytiles/tiles/{z}/{x}/{y}.mvt?") {
+		t.Fatalf("mounted TileJSON URL = %#v", tileURLs[0])
+	}
+
+	manifestResponse := httptest.NewRecorder()
+	mux.ServeHTTP(manifestResponse, httptest.NewRequest(http.MethodGet, "https://maps.example/tinytiles/sync/manifest.json", nil))
+	if manifestResponse.Code != http.StatusOK {
+		t.Fatalf("mounted manifest status = %d: %s", manifestResponse.Code, manifestResponse.Body.String())
+	}
+	var manifest offline.Manifest
+	if err := json.Unmarshal(manifestResponse.Body.Bytes(), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	wantTemplate := "https://maps.example/tinytiles/sync/tiles/{revision}/{z}/{x}/{y}"
+	if manifest.TileURLTemplate != wantTemplate {
+		t.Fatalf("mounted sync template = %q, want %q", manifest.TileURLTemplate, wantTemplate)
+	}
+
+	xyzResponse := httptest.NewRecorder()
+	mux.ServeHTTP(xyzResponse, httptest.NewRequest(http.MethodGet, "https://maps.example/tinytiles/tiles/2/1/1.mvt", nil))
+	if xyzResponse.Code != http.StatusOK {
+		t.Fatalf("mounted advertised XYZ URL status = %d: %s", xyzResponse.Code, xyzResponse.Body.String())
+	}
+	tmsResponse := httptest.NewRecorder()
+	mux.ServeHTTP(tmsResponse, httptest.NewRequest(http.MethodGet, "https://maps.example/tinytiles/sync/tiles/"+manifest.Revision+"/2/1/2", nil))
+	if tmsResponse.Code != http.StatusOK {
+		t.Fatalf("mounted advertised TMS URL status = %d: %s", tmsResponse.Code, tmsResponse.Body.String())
+	}
+}
+
+func TestPublicBaseOverridesMountPath(t *testing.T) {
+	server, err := New(Config{
+		Dataset:    testDataset(t),
+		DatasetID:  "fixture",
+		PublicBase: "https://cdn.example/public-map",
+		MountPath:  "/tinytiles",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	tileJSONResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(tileJSONResponse, httptest.NewRequest(http.MethodGet, "https://ignored.example/tilejson.json", nil))
+	var tileJSON map[string]any
+	if err := json.Unmarshal(tileJSONResponse.Body.Bytes(), &tileJSON); err != nil {
+		t.Fatal(err)
+	}
+	tileURLs := tileJSON["tiles"].([]any)
+	tileURL, ok := tileURLs[0].(string)
+	if !ok || !strings.HasPrefix(tileURL, "https://cdn.example/public-map/tiles/{z}/{x}/{y}.mvt?") || strings.Contains(tileURL, "/tinytiles/") {
+		t.Fatalf("PublicBase did not override mount path in TileJSON: %#v", tileURLs[0])
+	}
+
+	manifestResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(manifestResponse, httptest.NewRequest(http.MethodGet, "https://ignored.example/sync/manifest.json", nil))
+	var manifest offline.Manifest
+	if err := json.Unmarshal(manifestResponse.Body.Bytes(), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	wantTemplate := "https://cdn.example/public-map/sync/tiles/{revision}/{z}/{x}/{y}"
+	if manifest.TileURLTemplate != wantTemplate {
+		t.Fatalf("PublicBase did not override mount path in manifest: got %q want %q", manifest.TileURLTemplate, wantTemplate)
+	}
+}
+
 func TestConfigurationAndPathValidation(t *testing.T) {
 	if _, err := New(Config{}); err == nil {
 		t.Fatal("nil dataset accepted")
@@ -216,6 +305,26 @@ func TestConfigurationAndPathValidation(t *testing.T) {
 	for _, value := range []string{"ftp://tiles.example", "https://user@tiles.example", "https://tiles.example/?q=1"} {
 		if _, err := normalizePublicBase(value); err == nil {
 			t.Fatalf("public base accepted %q", value)
+		}
+	}
+	for _, test := range []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"/", ""},
+		{"/tinytiles", "/tinytiles"},
+		{"/tinytiles/", "/tinytiles"},
+		{"/maps/tinytiles", "/maps/tinytiles"},
+	} {
+		got, err := normalizeMountPath(test.input)
+		if err != nil || got != test.want {
+			t.Fatalf("normalizeMountPath(%q) = %q, %v; want %q, nil", test.input, got, err, test.want)
+		}
+	}
+	for _, value := range []string{"tinytiles", "//tinytiles", "/tinytiles//", "/tinytiles?x=1", "/tinytiles#fragment", "/tiny/../tiles", "/tiny//tiles", "/tiny%2Ftiles", "/tiny\\tiles"} {
+		if _, err := normalizeMountPath(value); err == nil {
+			t.Fatalf("mount path accepted %q", value)
 		}
 	}
 	for _, path := range []string{"2/1", "31/0/0", "2/4/1", "2/1/not-int"} {

@@ -13,7 +13,7 @@ import (
 	"syscall/js"
 	"time"
 
-	"github.com/Karte-Bayern/tinyTiles/offline"
+	"github.com/Karte-Bayern/tinyTiles/v2/offline"
 )
 
 // version is replaced with a SemVer tag by the release build. Keep the

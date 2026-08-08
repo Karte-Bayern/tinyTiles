@@ -5,30 +5,26 @@ package minigen
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"math"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
-
-	"github.com/SimonWaldherr/tinySQL/driver"
 )
 
-// Config controls the self-contained PBF to MBTiles build. The generator
+// Config controls the self-contained PBF to tile-stream build. The generator
 // intentionally emits transportation, buildings, water and land cover: it is a
 // portable offline fallback, not an attempt to duplicate a full cartographic
 // product.
 type Config struct {
 	PBFInputs   []string
-	MBTiles     string
+	Output      string
 	MinZoom     int
 	MaxZoom     int
 	Concurrency int
 }
 
-// Result describes the generated source MBTiles database.
+// Result describes the generated source tile stream.
 type Result struct {
 	Roads  int
 	Tiles  int
@@ -61,7 +57,7 @@ func (b *Bounds) add(point point) {
 	b.MaxLat = max(b.MaxLat, point[1])
 }
 
-// Build turns one or more OSM PBF files into a standard vector MBTiles file.
+// Build turns one or more OSM PBF files into a sequential vector tile stream.
 // It collects renderable references, loads only their coordinates, then streams
 // the renderable ways once for every requested zoom. This avoids retaining every
 // PBF node while keeping the implementation small.
@@ -69,8 +65,8 @@ func Build(ctx context.Context, cfg Config) (Result, error) {
 	if len(cfg.PBFInputs) == 0 {
 		return Result{}, fmt.Errorf("minigen: at least one PBF input is required")
 	}
-	if strings.TrimSpace(cfg.MBTiles) == "" {
-		return Result{}, fmt.Errorf("minigen: MBTiles output is required")
+	if strings.TrimSpace(cfg.Output) == "" {
+		return Result{}, fmt.Errorf("minigen: tile stream output is required")
 	}
 	if cfg.MinZoom < 0 || cfg.MaxZoom < cfg.MinZoom || cfg.MaxZoom > 22 {
 		return Result{}, fmt.Errorf("minigen: invalid zoom range %d..%d", cfg.MinZoom, cfg.MaxZoom)
@@ -91,16 +87,11 @@ func Build(ctx context.Context, cfg Config) (Result, error) {
 		return Result{}, fmt.Errorf("minigen: no renderable map features found in PBF input")
 	}
 
-	// tinySQL owns the SQLite-compatible file backend. The output remains a
-	// standard MBTiles database for interoperability with external tile tools.
-	db, err := driver.Open("file:" + cfg.MBTiles + "?tenant=default&mode=sqlite")
+	stream, err := createTileStream(cfg.Output, cfg, bounds)
 	if err != nil {
-		return Result{}, fmt.Errorf("minigen: open MBTiles: %w", err)
-	}
-	defer db.Close()
-	if err := initMBTiles(db, cfg, bounds); err != nil {
 		return Result{}, err
 	}
+	defer stream.Close()
 
 	result := Result{Bounds: bounds}
 	for zoom := cfg.MinZoom; zoom <= cfg.MaxZoom; zoom++ {
@@ -112,7 +103,7 @@ func Build(ctx context.Context, cfg Config) (Result, error) {
 			return Result{}, err
 		}
 		result.Roads += roads
-		written, err := writeZoom(db, builders)
+		written, err := writeZoom(stream, builders)
 		if err != nil {
 			return Result{}, err
 		}
@@ -240,7 +231,7 @@ func featureProperties(class string, tags map[string]string, includeRef bool) ma
 	return properties
 }
 
-func writeZoom(db *sql.DB, builders map[tileKey]*tileBuilder) (int, error) {
+func writeZoom(stream *tileStreamWriter, builders map[tileKey]*tileBuilder) (int, error) {
 	keys := make([]tileKey, 0, len(builders))
 	for key := range builders {
 		keys = append(keys, key)
@@ -254,34 +245,19 @@ func writeZoom(db *sql.DB, builders map[tileKey]*tileBuilder) (int, error) {
 		}
 		return keys[i].y < keys[j].y
 	})
-	tx, err := db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	stmt, err := tx.Prepare(`INSERT INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)`)
-	if err != nil {
-		_ = tx.Rollback()
-		return 0, err
-	}
-	defer stmt.Close()
 	written := 0
 	for _, key := range keys {
 		data, err := builders[key].encode()
 		if err != nil {
-			_ = tx.Rollback()
 			return 0, err
 		}
 		if len(data) == 0 {
 			continue
 		}
-		if _, err := stmt.Exec(key.z, key.x, xyzToTMS(key.y, key.z), data); err != nil {
-			_ = tx.Rollback()
+		if err := stream.Write(key.z, key.x, xyzToTMS(key.y, key.z), data); err != nil {
 			return 0, err
 		}
 		written++
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
 	}
 	return written, nil
 }
@@ -293,18 +269,7 @@ func (b *tileBuilder) encode() ([]byte, error) {
 	return encodeTile(b.key, b.layers)
 }
 
-func initMBTiles(db *sql.DB, cfg Config, bounds Bounds) error {
-	statements := []string{
-		`CREATE TABLE IF NOT EXISTS tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB, PRIMARY KEY (zoom_level, tile_column, tile_row))`,
-		`CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT)`,
-		`DELETE FROM tiles`,
-		`DELETE FROM metadata`,
-	}
-	for _, statement := range statements {
-		if _, err := db.Exec(statement); err != nil {
-			return fmt.Errorf("minigen: initialise MBTiles: %w", err)
-		}
-	}
+func tileStreamMetadata(cfg Config, bounds Bounds) map[string]string {
 	centerLon, centerLat := bounds.Center()
 	metadata := map[string]string{
 		"name":                "tinyTiles minimal OSM basemap",
@@ -312,29 +277,13 @@ func initMBTiles(db *sql.DB, cfg Config, bounds Bounds) error {
 		"version":             "1",
 		"format":              "pbf",
 		"kb:content_encoding": "gzip",
-		"minzoom":             strconv.Itoa(cfg.MinZoom),
-		"maxzoom":             strconv.Itoa(cfg.MaxZoom),
+		"minzoom":             fmt.Sprint(cfg.MinZoom),
+		"maxzoom":             fmt.Sprint(cfg.MaxZoom),
 		"bounds":              bounds.String(),
 		"center":              fmt.Sprintf("%.6f,%.6f,%d", centerLon, centerLat, cfg.MinZoom),
 		"json":                `{"vector_layers":[{"id":"water","fields":{"class":"String","name":"String"}},{"id":"landcover","fields":{"class":"String","name":"String"}},{"id":"building","fields":{"class":"String","name":"String"}},{"id":"transportation","fields":{"class":"String","name":"String"}}]}`,
 	}
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	stmt, err := tx.Prepare(`INSERT INTO metadata (name, value) VALUES (?, ?)`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	defer stmt.Close()
-	for key, value := range metadata {
-		if _, err := stmt.Exec(key, value); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-	}
-	return tx.Commit()
+	return metadata
 }
 
 func isRenderableWay(way *way) bool {

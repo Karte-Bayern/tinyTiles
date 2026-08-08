@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Karte-Bayern/tinyTiles/internal/pmtiles/pmtilestest"
+	"github.com/Karte-Bayern/tinyTiles/v2/internal/pmtiles/pmtilestest"
 )
 
 func buildArchive(t *testing.T, options pmtilestest.Options) string {

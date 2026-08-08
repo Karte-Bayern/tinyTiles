@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Karte-Bayern/tinyTiles/internal/pmtiles"
+	"github.com/Karte-Bayern/tinyTiles/v2/internal/pmtiles"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
 

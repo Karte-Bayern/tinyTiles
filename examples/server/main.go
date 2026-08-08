@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Karte-Bayern/tinyTiles/offline"
+	"github.com/Karte-Bayern/tinyTiles/v2/offline"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
 

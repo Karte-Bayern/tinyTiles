@@ -23,8 +23,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	tinytiles "github.com/Karte-Bayern/tinyTiles"
-	"github.com/Karte-Bayern/tinyTiles/offline"
+	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
+	"github.com/Karte-Bayern/tinyTiles/v2/offline"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
 
@@ -49,7 +49,16 @@ type Config struct {
 	// PublicBase is an optional canonical http(s) origin or base path used in
 	// TileJSON and sync manifests. Without it, the server derives an origin
 	// from the incoming request; deployments behind TLS proxies should set it.
+	// PublicBase takes precedence over MountPath and may itself include the
+	// complete public path prefix.
 	PublicBase string
+	// MountPath is the optional absolute path below which Handler is mounted,
+	// for example "/tinytiles". It does not mount or strip the handler itself;
+	// use http.StripPrefix at the application boundary. When PublicBase is
+	// empty, dynamically generated TileJSON and sync manifests append this path
+	// to the incoming request origin so their URLs remain reachable through the
+	// outer mount. Empty and "/" mean the root path.
+	MountPath string
 	// CORSOrigin is empty for no CORS header, * for public access, or one
 	// http(s) origin.
 	CORSOrigin string
@@ -92,6 +101,7 @@ type Config struct {
 type Server struct {
 	datasetID               string
 	publicBase              string
+	mountPath               string
 	corsOrigin              string
 	tileCacheBytes          int64
 	contentTypeOverride     string
@@ -152,6 +162,10 @@ func New(config Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	mountPath, err := normalizeMountPath(config.MountPath)
+	if err != nil {
+		return nil, err
+	}
 	corsOrigin, err := normalizeCORSOrigin(config.CORSOrigin)
 	if err != nil {
 		return nil, err
@@ -181,6 +195,7 @@ func New(config Config) (*Server, error) {
 	server := &Server{
 		datasetID:               config.DatasetID,
 		publicBase:              publicBase,
+		mountPath:               mountPath,
 		corsOrigin:              corsOrigin,
 		tileCacheBytes:          tileCacheBytes,
 		contentTypeOverride:     config.ContentType,
@@ -625,7 +640,7 @@ func (s *Server) baseURL(request *http.Request) (string, error) {
 	if err != nil || parsed.Host == "" || parsed.Host != host || parsed.Path != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", errors.New("request host is not a valid origin")
 	}
-	return candidate, nil
+	return candidate + s.mountPath, nil
 }
 
 // xyzTileURL returns the canonical cache-busting XYZ URL advertised in
@@ -649,6 +664,33 @@ func normalizePublicBase(value string) (string, error) {
 		return "", errors.New("tinytiles server: public base must be an absolute http(s) URL without credentials, query or fragment")
 	}
 	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+// normalizeMountPath accepts only a clean, absolute URL path. Unlike
+// PublicBase it intentionally cannot name an origin, query, fragment, or
+// encoded path separator: it describes the local mux mount, not an arbitrary
+// remote URL. A single trailing slash is normalized away so every generated
+// URL has exactly one separator before /tiles or /sync.
+func normalizeMountPath(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "/" {
+		return "", nil
+	}
+	if !strings.HasPrefix(value, "/") || strings.Contains(value, "//") || strings.ContainsAny(value, "?#\\%") {
+		return "", errors.New("tinytiles server: mount path must be a clean absolute path")
+	}
+	value = strings.TrimRight(value, "/")
+	if value == "" {
+		return "", nil
+	}
+	if path.Clean(value) != value {
+		return "", errors.New("tinytiles server: mount path must be a clean absolute path")
+	}
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != value {
+		return "", errors.New("tinytiles server: mount path must be a clean absolute path")
+	}
+	return value, nil
 }
 
 func normalizeCORSOrigin(value string) (string, error) {

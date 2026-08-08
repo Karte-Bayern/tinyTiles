@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	tinytiles "github.com/Karte-Bayern/tinyTiles"
-	"github.com/Karte-Bayern/tinyTiles/internal/pmtiles"
-	"github.com/Karte-Bayern/tinyTiles/internal/pmtiles/pmtilestest"
+	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
+	"github.com/Karte-Bayern/tinyTiles/v2/internal/pmtiles"
+	"github.com/Karte-Bayern/tinyTiles/v2/internal/pmtiles/pmtilestest"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
 

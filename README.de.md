@@ -508,8 +508,8 @@ import (
     "context"
     "net/http"
 
-    tinytiles "github.com/Karte-Bayern/tinyTiles"
-    "github.com/Karte-Bayern/tinyTiles/server"
+    tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
+    "github.com/Karte-Bayern/tinyTiles/v2/server"
 )
 
 dataset, err := tinytiles.Open(context.Background(), "region.ttiles", tinytiles.OpenOptions{

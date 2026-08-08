@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	tinytiles "github.com/Karte-Bayern/tinyTiles"
+	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
 	_ "github.com/SimonWaldherr/tinySQL/importer"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )

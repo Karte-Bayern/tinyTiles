@@ -42,6 +42,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return commandTile(args[1:], stdout, stderr)
 	case "benchmark":
 		return commandBenchmark(args[1:], stdout, stderr)
+	case "territory":
+		return commandTerritory(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "tinytiles: unknown command %q\n", args[0])
 		return 2
@@ -58,6 +60,9 @@ Usage:
   tinytiles inspect dataset.ttiles/
   tinytiles tile [flags] dataset.ttiles/ z x y
   tinytiles benchmark [flags] --source source.mbtiles --artifact dataset.ttiles/
+  tinytiles territory [flags] --input features.geojson --output out.geojson
+  tinytiles territory validate [flags] territories.csv
+  tinytiles territory inspect features.geojson
   tinytiles version
 
 Commands:
@@ -67,9 +72,11 @@ Commands:
   inspect    print the published semantic artifact information as JSON
   tile       read one TMS tile; use -out to write binary data to a file
   benchmark  compare warm TMS point-lookups with SQLite
+  territory  group, dissolve and export polygons into custom territories
 
 build, import and benchmark require the sqliteimport build tag. validate,
-inspect and tile use only the SQLite-free artifact reader on native targets.
+inspect, tile and territory use only the SQLite-free artifact reader (or, for
+territory, plain GeoJSON/CSV) on native targets.
 tinyTiles is a separate read artifact format. It does not claim to be a
 standards-compliant MBTiles/SQLite replacement.
 `)

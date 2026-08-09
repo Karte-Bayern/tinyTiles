@@ -5,23 +5,41 @@ import (
 	"compress/gzip"
 	"math"
 	"sort"
+
+	"github.com/Karte-Bayern/tinyTiles/v2/internal/minigen/simplify"
 )
 
 const (
 	geometryLine    = 2
 	geometryPolygon = 3
 	tileExtent      = 4096
+
+	// simplifyTolerance is a Visvalingam-Whyatt effective-area threshold in
+	// squared tile pixels (mapshaper.org's default simplification method).
+	// It is applied post-projection, in the tile's fixed 4096-unit extent, so
+	// the same tolerance is imperceptible at every zoom while discarding
+	// proportionally more geometry at low zooms, where each tile pixel spans
+	// far more ground distance.
+	simplifyTolerance = 4.0
 )
 
 type feature struct {
 	kind       int
 	points     []point
+	rings      []ring // multi-ring polygon (postal_code); when set, points is ignored
 	properties map[string]any
+}
+
+// ring is one exterior or interior member of a multi-ring polygon feature,
+// in unprojected WGS84 points. hole marks an interior (donut) ring.
+type ring struct {
+	points []point
+	hole   bool
 }
 
 func encodeTile(key tileKey, layers map[string][]feature) ([]byte, error) {
 	var tile []byte
-	for _, name := range []string{"water", "landcover", "building", "transportation"} {
+	for _, name := range []string{"water", "landcover", "building", "transportation", "postal_code"} {
 		if data := encodeLayer(name, key, layers[name]); len(data) > 0 {
 			tile = appendMessage(tile, 3, data)
 		}
@@ -109,11 +127,15 @@ func encodeLayer(name string, key tileKey, features []feature) []byte {
 func encodeValue(s string) []byte { return appendMessage(nil, 1, []byte(s)) }
 
 func encodeGeometry(f feature, key tileKey) []byte {
+	if f.kind == geometryPolygon && len(f.rings) > 0 {
+		return encodeRings(f.rings, key)
+	}
 	points := make([][2]int, 0, len(f.points))
 	for _, p := range f.points {
 		points = append(points, projectPoint(p, key))
 	}
 	if f.kind == geometryLine {
+		points = simplifyPixels(points, simplifyTolerance, false)
 		points = clipLine(points)
 		if len(points) < 2 {
 			return nil
@@ -124,6 +146,7 @@ func encodeGeometry(f feature, key tileKey) []byte {
 		if len(points) > 1 && points[0] == points[len(points)-1] {
 			points = points[:len(points)-1]
 		}
+		points = simplifyPixels(points, simplifyTolerance, true)
 		points = clipPolygon(points)
 		if len(points) < 3 {
 			return nil
@@ -131,6 +154,83 @@ func encodeGeometry(f feature, key tileKey) []byte {
 		return commandGeometry(points, true)
 	}
 	return nil
+}
+
+// encodeRings emits one multi-ring polygon geometry: every ring is
+// projected, simplified, clipped and wound independently, then chained into
+// the same MoveTo/LineTo/ClosePath command stream. A ring's fill role
+// (exterior vs. hole) comes entirely from its winding direction, so emission
+// order does not need to pair a hole with its containing exterior ring — a
+// point-in-tile rasterizer resolves that from the accumulated windings.
+func encodeRings(rings []ring, key tileKey) []byte {
+	var out []byte
+	last := [2]int{}
+	wrote := false
+	for _, r := range rings {
+		points := make([][2]int, 0, len(r.points))
+		for _, p := range r.points {
+			points = append(points, projectPoint(p, key))
+		}
+		if len(points) > 1 && points[0] == points[len(points)-1] {
+			points = points[:len(points)-1]
+		}
+		points = simplifyPixels(points, simplifyTolerance, true)
+		points = clipPolygon(points)
+		if len(points) < 3 {
+			continue
+		}
+		points = ensureWinding(points, !r.hole)
+		out, last = appendRing(out, points, last, true)
+		wrote = true
+	}
+	if !wrote {
+		return nil
+	}
+	return out
+}
+
+// ensureWinding reverses points if needed so its signed area's sign matches
+// clockwise (the Mapbox Vector Tile Spec's required exterior-ring winding in
+// a tile's Y-down pixel space; holes take the opposite winding).
+func ensureWinding(points [][2]int, clockwise bool) [][2]int {
+	if (signedArea(points) > 0) == clockwise {
+		return points
+	}
+	reversed := make([][2]int, len(points))
+	for i, p := range points {
+		reversed[len(points)-1-i] = p
+	}
+	return reversed
+}
+
+func signedArea(points [][2]int) float64 {
+	var sum float64
+	for i, a := range points {
+		b := points[(i+1)%len(points)]
+		sum += float64(a[0])*float64(b[1]) - float64(b[0])*float64(a[1])
+	}
+	return sum
+}
+
+// simplifyPixels runs Visvalingam-Whyatt simplification on already-projected
+// tile-pixel coordinates, rounding back to the integer grid the rest of the
+// encoder expects.
+func simplifyPixels(points [][2]int, tolerance float64, closed bool) [][2]int {
+	in := make([]simplify.Point, len(points))
+	for i, p := range points {
+		in[i] = simplify.Point{float64(p[0]), float64(p[1])}
+	}
+	var out []simplify.Point
+	if closed {
+		out = simplify.Ring(in, tolerance)
+	} else {
+		out = simplify.Line(in, tolerance)
+	}
+	result := make([][2]int, len(out))
+	for i, p := range out {
+		result[i] = [2]int{int(math.Round(p[0])), int(math.Round(p[1]))}
+	}
+	return result
 }
 
 func projectPoint(p point, key tileKey) [2]int {
@@ -142,21 +242,28 @@ func projectPoint(p point, key tileKey) [2]int {
 }
 
 func commandGeometry(points [][2]int, polygon bool) []byte {
-	var out []byte
+	out, _ := appendRing(nil, points, [2]int{}, polygon)
+	return out
+}
+
+// appendRing emits MoveTo + LineTo* (+ ClosePath when close) for one ring or
+// line, continuing the running delta-cursor from last, and returns the
+// extended buffer plus the cursor's new position.
+func appendRing(out []byte, points [][2]int, last [2]int, close bool) ([]byte, [2]int) {
 	out = appendVarint(out, 9)
-	out = appendPoint(out, points[0], [2]int{})
+	out = appendPoint(out, points[0], last)
+	last = points[0]
 	if len(points) > 1 {
 		out = appendVarint(out, uint64((len(points)-1)<<3|2))
-		last := points[0]
 		for _, p := range points[1:] {
 			out = appendPoint(out, p, last)
 			last = p
 		}
 	}
-	if polygon {
+	if close {
 		out = appendVarint(out, 15)
 	}
-	return out
+	return out, last
 }
 func appendPoint(out []byte, p, last [2]int) []byte {
 	return appendVarint(appendVarint(out, zigzagEncode(int64(p[0]-last[0]))), zigzagEncode(int64(p[1]-last[1])))

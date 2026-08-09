@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Karte-Bayern/tinyTiles/v2/internal/geo"
 	"github.com/Karte-Bayern/tinyTiles/v2/internal/minigen"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
@@ -32,6 +33,7 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	keepWork := fs.Bool("keep-work", false, "keep temporary source MBTiles and generator files for inspection")
 	minZoom := fs.Int("minzoom", 5, "minimum tile zoom")
 	maxZoom := fs.Int("maxzoom", 14, "maximum tile zoom")
+	postalCodes := fs.Bool("postal-codes", false, "built-in generator only: add a postal_code vector layer from boundary=postal_code relations and write a <dataset-base>.postcodes.geojson sidecar")
 	buildingMinZoom := fs.Int("building-minzoom", 12, "external generator only: minimum building zoom")
 	shards := fs.Int("shards", 256, "external generator only: temporary generator shard count")
 	shardCompression := fs.Bool("shard-compression", true, "external generator only: compress temporary generator shards")
@@ -161,6 +163,7 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	defer cancel()
 	fmt.Fprintln(stdout, "phase=generate")
 	var provenance map[string]any
+	var postalFeatures []minigen.PostalFeature
 	if generatorName := strings.TrimSpace(*generator); generatorName == "" {
 		fmt.Fprintln(stdout, "generator=tinytiles-minimal")
 		result, err := minigen.Build(ctx, minigen.Config{
@@ -169,13 +172,18 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 			MinZoom:     *minZoom,
 			MaxZoom:     *maxZoom,
 			Concurrency: *concurrency,
+			PostalCodes: *postalCodes,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "tinytiles build: built-in generation failed: %v\n", err)
 			return 1
 		}
 		fmt.Fprintf(stdout, "road-features=%d tiles=%d bounds=%s\n", result.Roads, result.Tiles, result.Bounds.String())
+		postalFeatures = result.PostalCodes
 		provenance, err = options.builtinProvenance()
+	} else if *postalCodes {
+		fmt.Fprintln(stderr, "tinytiles build: --postal-codes requires the built-in generator (no --generator)")
+		return 2
 	} else {
 		generatorPath, lookupErr := exec.LookPath(generatorName)
 		if lookupErr != nil {
@@ -216,7 +224,40 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	if *mbtilesOut != "" {
 		fmt.Fprintf(stdout, "mbtiles=%s\n", mbtiles)
 	}
+	if len(postalFeatures) > 0 {
+		sidecarPath, err := writePostalCodesSidecar(fs.Arg(1), postalFeatures)
+		if err != nil {
+			fmt.Fprintf(stderr, "tinytiles build: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "postal-codes=%d postcodes-geojson=%s\n", len(postalFeatures), sidecarPath)
+	}
 	return 0
+}
+
+// writePostalCodesSidecar writes assembled postal-code boundaries as a
+// standalone GeoJSON FeatureCollection next to the published artifact —
+// directly usable as `tinytiles territory --input`.
+func writePostalCodesSidecar(artifactPath string, features []minigen.PostalFeature) (string, error) {
+	geoFeatures := make([]geo.Feature, len(features))
+	for i, f := range features {
+		properties := map[string]any{"postcode": f.Code}
+		if f.Name != "" {
+			properties["name"] = f.Name
+		}
+		geoFeatures[i] = geo.Feature{Properties: properties, Geometry: f.Geometry}
+	}
+	data, err := geo.WriteFeatureCollection(geoFeatures)
+	if err != nil {
+		return "", fmt.Errorf("encode postal code sidecar: %w", err)
+	}
+	dir, base := filepath.Split(filepath.Clean(artifactPath))
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+	path := filepath.Join(dir, base+".postcodes.geojson")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", fmt.Errorf("write postal code sidecar: %w", err)
+	}
+	return path, nil
 }
 
 func (o externalGeneratorOptions) builtinProvenance() (map[string]any, error) {

@@ -22,11 +22,23 @@ type node struct {
 	Lon, Lat float64
 }
 type way struct {
+	ID      int64
 	NodeIDs []int64
 	Tags    map[string]string
 }
 
 func scanPBF(ctx context.Context, path string, _ int, visit func(*node, *way) error) error {
+	return scanBlocks(ctx, path, func(data []byte) error {
+		return parsePrimitiveBlock(data, visit)
+	})
+}
+
+// scanBlocks reads every OSMData primitive block out of a PBF file, in
+// order, and hands its decompressed payload to fn. It is the shared,
+// format-level half of scanning: relation.go reuses it with its own
+// relation-focused block parser instead of duplicating the blob-header and
+// zlib-unpacking loop.
+func scanBlocks(ctx context.Context, path string, fn func(data []byte) error) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("minigen: open PBF %q: %w", path, err)
@@ -68,7 +80,7 @@ func scanPBF(ctx context.Context, path string, _ int, visit func(*node, *way) er
 		if err != nil {
 			return fmt.Errorf("minigen: decode PBF %q: %w", path, err)
 		}
-		if err := parsePrimitiveBlock(data, visit); err != nil {
+		if err := fn(data); err != nil {
 			return fmt.Errorf("minigen: decode PBF %q: %w", path, err)
 		}
 	}
@@ -265,16 +277,23 @@ func parseWay(b []byte, table []string) (*way, error) {
 	w := &way{Tags: map[string]string{}}
 	var keys, vals, refs []uint64
 	err := walkProto(b, func(n, wire int, v []byte, x uint64) error {
-		if wire != 2 {
-			return nil
-		}
 		switch n {
+		case 1:
+			if wire == 0 {
+				w.ID = int64(x) // plain (non-zigzag) int64, unlike a node's sint64 id
+			}
 		case 2:
-			keys = packedVarints(v)
+			if wire == 2 {
+				keys = packedVarints(v)
+			}
 		case 3:
-			vals = packedVarints(v)
+			if wire == 2 {
+				vals = packedVarints(v)
+			}
 		case 8:
-			refs = packedVarints(v)
+			if wire == 2 {
+				refs = packedVarints(v)
+			}
 		}
 		return nil
 	})

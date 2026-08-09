@@ -37,6 +37,14 @@ type PBFBuildOptions struct {
 	MaxZoom     int
 	Concurrency int
 
+	// PostalCodes adds a "postal_code" vector layer assembled from OSM
+	// boundary=postal_code relations, and writes a GeoJSON sidecar file of
+	// the same boundaries next to ArtifactPath (see
+	// PBFBuildResult.PostalCodesPath) — directly usable as `tinytiles
+	// territory --input` input. It costs an extra PBF scan pass, so it is
+	// opt-in.
+	PostalCodes bool
+
 	Schema         tiles.Schema
 	BatchSize      int
 	MaxMemoryBytes int64
@@ -81,5 +89,11 @@ type PBFBuildResult struct {
 	Estimate       tiles.ResourceEstimate
 	RoadFeatures   int
 	GeneratedTiles int
-	Bounds         PBFBounds
+	// PostalCodeCount and PostalCodesPath are set only when
+	// PBFBuildOptions.PostalCodes was requested and at least one
+	// boundary=postal_code relation was assembled: PostalCodesPath names the
+	// written GeoJSON sidecar file.
+	PostalCodeCount int
+	PostalCodesPath string
+	Bounds          PBFBounds
 }

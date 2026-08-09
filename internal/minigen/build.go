@@ -22,13 +22,20 @@ type Config struct {
 	MinZoom     int
 	MaxZoom     int
 	Concurrency int
+
+	// PostalCodes adds a "postal_code" vector layer assembled from
+	// boundary=postal_code relations, and populates Result.PostalCodes. It
+	// costs an extra relation/way scan pass, so it is opt-in: a default
+	// build never pays for it.
+	PostalCodes bool
 }
 
 // Result describes the generated source tile stream.
 type Result struct {
-	Roads  int
-	Tiles  int
-	Bounds Bounds
+	Roads       int
+	Tiles       int
+	Bounds      Bounds
+	PostalCodes []PostalFeature
 }
 
 // Bounds is the WGS84 extent of the road geometry written to the tileset.
@@ -87,13 +94,21 @@ func Build(ctx context.Context, cfg Config) (Result, error) {
 		return Result{}, fmt.Errorf("minigen: no renderable map features found in PBF input")
 	}
 
+	var postalFeatures []PostalFeature
+	if cfg.PostalCodes {
+		postalFeatures, err = collectPostalFeatures(ctx, cfg.PBFInputs, cfg.Concurrency)
+		if err != nil {
+			return Result{}, err
+		}
+	}
+
 	stream, err := createTileStream(cfg.Output, cfg, bounds)
 	if err != nil {
 		return Result{}, err
 	}
 	defer stream.Close()
 
-	result := Result{Bounds: bounds}
+	result := Result{Bounds: bounds, PostalCodes: postalFeatures}
 	for zoom := cfg.MinZoom; zoom <= cfg.MaxZoom; zoom++ {
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
@@ -103,6 +118,9 @@ func Build(ctx context.Context, cfg Config) (Result, error) {
 			return Result{}, err
 		}
 		result.Roads += roads
+		if len(postalFeatures) > 0 && zoom >= postalMinZoom {
+			addPostalFeatures(builders, zoom, postalFeatures)
+		}
 		written, err := writeZoom(stream, builders)
 		if err != nil {
 			return Result{}, err
@@ -201,7 +219,7 @@ func buildZoom(ctx context.Context, inputs []string, coords map[int64]point, zoo
 }
 
 func addFeature(builders map[tileKey]*tileBuilder, zoom int, layer string, f feature) {
-	minLon, minLat, maxLon, maxLat := lineBounds(f.points)
+	minLon, minLat, maxLon, maxLat := featureBounds(f)
 	x0, y0 := lonLatToTile(minLon, maxLat, zoom)
 	x1, y1 := lonLatToTile(maxLon, minLat, zoom)
 	// A malformed geometry spanning much of the world would otherwise fan out
@@ -274,6 +292,11 @@ func (b *tileBuilder) encode() ([]byte, error) {
 
 func tileStreamMetadata(cfg Config, bounds Bounds) map[string]string {
 	centerLon, centerLat := bounds.Center()
+	vectorLayers := `[{"id":"water","fields":{"class":"String","name":"String"}},{"id":"landcover","fields":{"class":"String","name":"String"}},{"id":"building","fields":{"class":"String","name":"String"}},{"id":"transportation","fields":{"class":"String","name":"String"}}`
+	if cfg.PostalCodes {
+		vectorLayers += `,{"id":"postal_code","fields":{"class":"String","postal_code":"String","name":"String"}}`
+	}
+	vectorLayers += `]`
 	metadata := map[string]string{
 		"name":                "tinyTiles minimal OSM basemap",
 		"type":                "baselayer",
@@ -284,7 +307,7 @@ func tileStreamMetadata(cfg Config, bounds Bounds) map[string]string {
 		"maxzoom":             fmt.Sprint(cfg.MaxZoom),
 		"bounds":              bounds.String(),
 		"center":              fmt.Sprintf("%.6f,%.6f,%d", centerLon, centerLat, cfg.MinZoom),
-		"json":                `{"vector_layers":[{"id":"water","fields":{"class":"String","name":"String"}},{"id":"landcover","fields":{"class":"String","name":"String"}},{"id":"building","fields":{"class":"String","name":"String"}},{"id":"transportation","fields":{"class":"String","name":"String"}}]}`,
+		"json":                `{"vector_layers":` + vectorLayers + `}`,
 	}
 	return metadata
 }
@@ -355,6 +378,22 @@ func wayLine(coords map[int64]point, ids []int64) []point {
 		}
 	}
 	return line
+}
+
+// featureBounds computes a feature's WGS84 extent from whichever geometry
+// field it uses: the single points ring, or every ring for a multi-ring
+// polygon.
+func featureBounds(f feature) (minLon, minLat, maxLon, maxLat float64) {
+	if len(f.rings) == 0 {
+		return lineBounds(f.points)
+	}
+	minLon, minLat, maxLon, maxLat = math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)
+	for _, r := range f.rings {
+		rMinLon, rMinLat, rMaxLon, rMaxLat := lineBounds(r.points)
+		minLon, minLat = min(minLon, rMinLon), min(minLat, rMinLat)
+		maxLon, maxLat = max(maxLon, rMaxLon), max(maxLat, rMaxLat)
+	}
+	return
 }
 
 func lineBounds(line []point) (minLon, minLat, maxLon, maxLat float64) {

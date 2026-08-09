@@ -56,3 +56,21 @@ the browser can read the checksum and raw tile-encoding headers.
 The standalone binary is intentionally a small integration. Do not expose it directly
 to the internet without authentication, TLS, resource limits, rate limiting
 and deployment-specific observability.
+
+## 4. Territory Builder: sales, field-service and delivery zones
+
+```bash
+tinytiles territory \
+  --input examples/territory/postcodes.geojson \
+  --mapping examples/territory/territories.csv \
+  --group-by sales_territory \
+  --output sales-territories.geojson
+```
+
+Groups postal-code (or any other) polygons into custom business
+territories — sales regions, field-service areas, delivery zones — by
+dissolving each group's member polygons into one MultiPolygon and attaching
+aggregated business metadata. See [examples/territory/README.md](territory/README.md)
+for the three worked scenarios (sales/field-service/delivery), CSV mapping,
+prefix grouping, the Power BI export preset, and `territory validate`/
+`territory inspect`.

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Karte-Bayern/tinyTiles/v2/internal/geo"
 	"github.com/Karte-Bayern/tinyTiles/v2/internal/minigen"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
@@ -45,6 +46,7 @@ func BuildPBF(ctx context.Context, options PBFBuildOptions) (PBFBuildResult, err
 		MinZoom:     resolved.MinZoom,
 		MaxZoom:     resolved.MaxZoom,
 		Concurrency: resolved.Concurrency,
+		PostalCodes: resolved.PostalCodes,
 	})
 	if err != nil {
 		return PBFBuildResult{}, fmt.Errorf("tinytiles: generate PBF tiles: %w", err)
@@ -74,15 +76,26 @@ func BuildPBF(ctx context.Context, options PBFBuildOptions) (PBFBuildResult, err
 	if err != nil {
 		return PBFBuildResult{}, fmt.Errorf("tinytiles: publish generated tiles: %w", err)
 	}
+
+	var postalCodesPath string
+	if len(generated.PostalCodes) > 0 {
+		postalCodesPath, err = writePostalCodesSidecar(options.ArtifactPath, generated.PostalCodes)
+		if err != nil {
+			return PBFBuildResult{}, err
+		}
+	}
+
 	return PBFBuildResult{
 		// Preserve the caller's spelling (including a symlinked parent) just
 		// like the public tinySQL import API. Internally we use the canonical
 		// path above solely for overlap checks and atomic publication.
-		ArtifactPath:   options.ArtifactPath,
-		Info:           imported.Info,
-		Estimate:       imported.Estimate,
-		RoadFeatures:   generated.Roads,
-		GeneratedTiles: generated.Tiles,
+		ArtifactPath:    options.ArtifactPath,
+		Info:            imported.Info,
+		Estimate:        imported.Estimate,
+		RoadFeatures:    generated.Roads,
+		GeneratedTiles:  generated.Tiles,
+		PostalCodeCount: len(generated.PostalCodes),
+		PostalCodesPath: postalCodesPath,
 		Bounds: PBFBounds{
 			MinLon: generated.Bounds.MinLon,
 			MinLat: generated.Bounds.MinLat,
@@ -90,6 +103,39 @@ func BuildPBF(ctx context.Context, options PBFBuildOptions) (PBFBuildResult, err
 			MaxLat: generated.Bounds.MaxLat,
 		},
 	}, nil
+}
+
+// postalCodesSidecarPath derives the sidecar GeoJSON path from an artifact
+// path by replacing its final extension (".ttiles", "/", ...) with
+// ".postcodes.geojson", e.g. "region.ttiles/" -> "region.postcodes.geojson".
+func postalCodesSidecarPath(artifactPath string) string {
+	dir, base := filepath.Split(filepath.Clean(artifactPath))
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+	return filepath.Join(dir, base+".postcodes.geojson")
+}
+
+// writePostalCodesSidecar writes the assembled postal-code boundaries as a
+// standalone GeoJSON FeatureCollection next to the published artifact — the
+// same format `tinytiles territory --input` reads, so a build with
+// PostalCodes enabled can feed straight into territory building.
+func writePostalCodesSidecar(artifactPath string, features []minigen.PostalFeature) (string, error) {
+	geoFeatures := make([]geo.Feature, len(features))
+	for i, f := range features {
+		properties := map[string]any{"postcode": f.Code}
+		if f.Name != "" {
+			properties["name"] = f.Name
+		}
+		geoFeatures[i] = geo.Feature{Properties: properties, Geometry: f.Geometry}
+	}
+	data, err := geo.WriteFeatureCollection(geoFeatures)
+	if err != nil {
+		return "", fmt.Errorf("tinytiles: encode postal code sidecar: %w", err)
+	}
+	path := postalCodesSidecarPath(artifactPath)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", fmt.Errorf("tinytiles: write postal code sidecar: %w", err)
+	}
+	return path, nil
 }
 
 // pbfTileStreamSource bridges minigen's SQLite-free sequential tile stream to

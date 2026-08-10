@@ -209,6 +209,43 @@ func TestHandlerTileJSONAndConditionalResponses(t *testing.T) {
 	}
 }
 
+func TestHandlerServesMapLibreStyle(t *testing.T) {
+	server := testServer(t)
+	request := httptest.NewRequest(http.MethodGet, "https://tiles.example/style.json", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("style.json status = %d: %s", response.Code, response.Body.String())
+	}
+	var style map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &style); err != nil {
+		t.Fatal(err)
+	}
+	if style["version"] != float64(8) {
+		t.Fatalf("style version = %v, want 8", style["version"])
+	}
+	sources, ok := style["sources"].(map[string]any)
+	if !ok {
+		t.Fatalf("sources = %#v", style["sources"])
+	}
+	source, ok := sources["tinytiles"].(map[string]any)
+	if !ok {
+		t.Fatalf("tinytiles source = %#v", sources["tinytiles"])
+	}
+	tileURLs, ok := source["tiles"].([]any)
+	if !ok || len(tileURLs) != 1 || !strings.HasPrefix(tileURLs[0].(string), "https://tiles.example/") {
+		t.Fatalf("style tile URLs = %#v", source["tiles"])
+	}
+
+	conditional := httptest.NewRequest(http.MethodGet, "https://tiles.example/style.json", nil)
+	conditional.Header.Set("If-None-Match", response.Header().Get("ETag"))
+	notModified := httptest.NewRecorder()
+	server.Handler().ServeHTTP(notModified, conditional)
+	if notModified.Code != http.StatusNotModified {
+		t.Fatalf("conditional style.json status = %d", notModified.Code)
+	}
+}
+
 func TestMountedHandlerAdvertisesMountPath(t *testing.T) {
 	server, err := New(Config{Dataset: testDataset(t), DatasetID: "fixture", MountPath: "/tinytiles"})
 	if err != nil {

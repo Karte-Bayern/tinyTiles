@@ -43,6 +43,7 @@ func main() {
 		memory      = flag.Int64("max-memory", 64<<20, "per-reader tinySQL cache budget in bytes (0 uses default)")
 		tileCache   = flag.Int64("tile-cache-bytes", server.DefaultTileCacheBytes, "immutable tile cache budget in bytes (-1 disables)")
 		demEncoding = flag.String("dem-encoding", "", "declare a raster tileset as elevation data: terrarium, mapbox or custom")
+		postcodes   = flag.String("postcodes", "", "optional postal-code boundary GeoJSON (the sidecar `tinytiles build --postal-codes` writes); enables /postcode/{code}, /postcode/search and /postcode/at")
 	)
 	flag.Parse()
 	if *showVersion {
@@ -61,7 +62,10 @@ func main() {
 	}
 	var current atomic.Pointer[tinytiles.Dataset]
 	current.Store(dataset)
-	handler, err := server.New(server.Config{Dataset: dataset, DatasetID: *datasetID, PublicBase: *publicBase, CORSOrigin: *corsOrigin, TileCacheBytes: *tileCache, DEMEncoding: *demEncoding})
+	handler, err := server.New(server.Config{
+		Dataset: dataset, DatasetID: *datasetID, PublicBase: *publicBase, CORSOrigin: *corsOrigin,
+		TileCacheBytes: *tileCache, DEMEncoding: *demEncoding, PostcodeIndexPath: *postcodes,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}

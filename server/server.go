@@ -92,6 +92,12 @@ type Config struct {
 	// PrefetchMaxTiles bounds work accepted from one route. Zero selects
 	// DefaultPrefetchMaxTiles.
 	PrefetchMaxTiles int
+	// PostcodeIndexPath is an optional GeoJSON FeatureCollection of postal
+	// code boundaries (the sidecar a PostalCodes-enabled build writes; see
+	// BuildPBF and `tinytiles build --postal-codes`) that, when set, is
+	// loaded once and served at GET /postcode/{code}, /postcode/search?q=
+	// and /postcode/at?lon=&lat=. Empty leaves those routes unregistered.
+	PostcodeIndexPath string
 }
 
 // Server is a handler factory. It is safe for concurrent requests as long as
@@ -114,6 +120,10 @@ type Server struct {
 	prefetchMu              sync.Mutex
 	prefetcher              *tilePrefetcher
 	prefetchClosed          bool
+	// postcodeIndex is set once in New and never mutated afterward, so it is
+	// safe to read from concurrent requests without locking — the same
+	// contract as the plain fields above.
+	postcodeIndex *postcodeIndex
 
 	gen atomic.Pointer[generation]
 }
@@ -138,6 +148,8 @@ type generation struct {
 	manifestPayload []byte
 	tileJSONPayload []byte
 	tileJSONETag    string
+	stylePayload    []byte
+	styleETag       string
 
 	// The *Gzip fields hold a precomputed gzip encoding of the corresponding
 	// payload above, or nil when compressing did not actually shrink it (a
@@ -147,6 +159,7 @@ type generation struct {
 	metadataPayloadGzip []byte
 	manifestPayloadGzip []byte
 	tileJSONPayloadGzip []byte
+	stylePayloadGzip    []byte
 }
 
 // New validates the static server configuration. It does not open or close
@@ -169,6 +182,13 @@ func New(config Config) (*Server, error) {
 	corsOrigin, err := normalizeCORSOrigin(config.CORSOrigin)
 	if err != nil {
 		return nil, err
+	}
+	var postcodeIndex *postcodeIndex
+	if strings.TrimSpace(config.PostcodeIndexPath) != "" {
+		postcodeIndex, err = loadPostcodeIndex(config.PostcodeIndexPath)
+		if err != nil {
+			return nil, fmt.Errorf("tinytiles server: load postcode index %q: %w", config.PostcodeIndexPath, err)
+		}
 	}
 	if config.TileCacheBytes < -1 {
 		return nil, errors.New("tinytiles server: tile cache bytes must be non-negative or -1 to disable")
@@ -205,6 +225,7 @@ func New(config Config) (*Server, error) {
 		prefetchWorkers:         prefetchWorkers,
 		prefetchQueue:           prefetchQueue,
 		prefetchMaxTiles:        prefetchMaxTiles,
+		postcodeIndex:           postcodeIndex,
 	}
 	gen, err := server.buildGeneration(config.Dataset)
 	if err != nil {
@@ -308,6 +329,12 @@ func (s *Server) buildGeneration(dataset *tinytiles.Dataset) (*generation, error
 		}
 		gen.tileJSONETag = quoteETag(digest(gen.tileJSONPayload))
 		gen.tileJSONPayloadGzip = gzipIfSmaller(gen.tileJSONPayload)
+		gen.stylePayload, err = json.Marshal(buildStyle(gen.metadata, tileURL, gen.contentType))
+		if err != nil {
+			return nil, fmt.Errorf("tinytiles server: encode style: %w", err)
+		}
+		gen.styleETag = quoteETag(digest(gen.stylePayload))
+		gen.stylePayloadGzip = gzipIfSmaller(gen.stylePayload)
 	}
 	return gen, nil
 }
@@ -379,7 +406,11 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/tiles/", http.StripPrefix("/tiles/", s.XYZHandler()))
 	mux.Handle("/sync/", http.StripPrefix("/sync", s.syncHandler()))
 	mux.HandleFunc("/tilejson.json", s.serveTileJSON)
+	mux.HandleFunc("/style.json", s.serveStyle)
 	mux.HandleFunc("/metadata", s.serveMetadata)
+	if s.postcodeIndex != nil {
+		mux.HandleFunc("/postcode/", s.servePostcode)
+	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	return s.withCORS(mux)
 }

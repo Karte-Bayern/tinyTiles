@@ -18,10 +18,19 @@ validated, SQLite-free read path is useful.
 - exact TMS point and spatial-range reads through tinySQL's public API;
 - atomic `.ttiles` publication and full post-write validation;
 - self-contained OSM PBF → MBTiles → `.ttiles` generation with a compact,
-  road-focused vector layer; richer compatible generators remain optional;
+  road-focused vector layer, an optional `postal_code` boundary layer
+  assembled from `boundary=postal_code` relations, and Visvalingam-Whyatt
+  (mapshaper.org-style) geometry simplification; richer compatible generators
+  remain optional;
 - an importable concurrent `Dataset`, a mountable HTTP server and a small
   standalone server binary with automatic vector/raster MIME and URL-extension
-  inference, plus durable native and browser IndexedDB caches;
+  inference, an auto-generated MapLibre GL style at `/style.json`, an optional
+  postal-code search/reverse-lookup API, plus durable native and browser
+  IndexedDB caches;
+- a generic territory builder (`tinytiles territory`) that groups postal
+  codes or any other polygon dataset — by prefix or an arbitrary CSV/JSON
+  mapping — into dissolved sales, field-service or delivery-zone territories,
+  with GeoJSON/TopoJSON/CSV export and a Power BI preset;
 - reproducible tests, race checks, WASM compilation, benchmarks and demos.
 
 ## Works well with
@@ -51,7 +60,10 @@ path once you already have it.
 - **[MapLibre GL JS](https://maplibre.org)**, Mapbox GL JS, OpenLayers and
   deck.gl all consume the TileJSON tinyTiles serves at `/tilejson.json`,
   including `vector_layers`/`tilestats` for a vector tileset and `encoding`
-  for a raster DEM terrain source.
+  for a raster DEM terrain source. `/style.json` goes one step further and
+  serves a ready-to-use MapLibre GL style — paint rules for whichever layers
+  the dataset actually has — verified by loading it in a real MapLibre GL JS
+  map during development, not just schema-checking the JSON.
 - **[QGIS](https://qgis.org)** can add a tinyTiles endpoint directly as a
   vector or raster tile layer through its TileJSON/XYZ connection dialog —
   useful for inspecting a published artifact without writing client code.
@@ -326,6 +338,7 @@ tinytiles validate   dataset.ttiles/
 tinytiles inspect    dataset.ttiles/
 tinytiles tile       dataset.ttiles/ z x y
 tinytiles benchmark  --source source.mbtiles --artifact dataset.ttiles/
+tinytiles territory  --input features.geojson --output out.geojson
 tinytiles version
 tinytiles-server     -artifact dataset.ttiles/ -dataset region
 ```
@@ -412,9 +425,26 @@ artifact. The built-in tileset contains transportation, building, water and
 landcover layers. No other project's binary, repository or network service is
 used.
 
-This compact first version renders closed OSM ways; complex multipolygon
+This compact first version renders closed OSM ways; general multipolygon
 relations intentionally remain the responsibility of an optional richer
-generator.
+generator. The one exception is `boundary=postal_code` relations: pass
+`--postal-codes` to assemble them (joining split way segments, matching
+`outer`/`inner` roles, nesting holes under the right exterior) into a
+`postal_code` vector layer, and to write a `<dataset-base>.postcodes.geojson`
+sidecar next to the published artifact — a plain GeoJSON FeatureCollection
+that is also valid input to `tinytiles territory --input` (see
+[Territory building](#territory-building)) or to
+[mapshaper.org](https://mapshaper.org) for further simplification/editing:
+
+```bash
+./dist/tinytiles build --postal-codes \
+  --minzoom 8 --maxzoom 14 \
+  region.osm.pbf region.ttiles/
+```
+
+Serving that artifact with `-postcodes region.postcodes.geojson` (see
+[Serve and synchronize offline tiles](#serve-and-synchronize-offline-tiles))
+adds a suche-postleitzahl.org-style lookup/search/reverse-geocode API on top.
 
 For a richer local tileset, `--generator` remains an explicit override. It
 must write the requested MBTiles file using the compatible command-line flags:
@@ -432,6 +462,46 @@ Multiple PBF files are comma-separated. `--min-lat`, `--min-lon`, `--max-lat`,
 external generator only. The checksummed artifact manifest records portable
 PBF provenance (input basenames/sizes and generator configuration), never
 machine-local absolute paths.
+
+## Territory building
+
+`tinytiles territory` turns postal-code polygons, administrative boundaries,
+or any other GeoJSON polygon dataset into custom business territories — sales
+regions, field-service areas, delivery zones — without assuming its input is
+postal codes: geometries are grouped by a postcode prefix or by any column of
+an external CSV/JSON mapping, dissolved (touching polygons merge; unrelated
+ones correctly stay a disconnected `MultiPolygon`; holes are preserved), then
+exported.
+
+```bash
+tinytiles territory \
+  --input postcodes.geojson \
+  --mapping territories.csv \
+  --group-by employee \
+  --simplify 50m \
+  --output sales-territories.geojson
+```
+
+Where source records disagree on a field within one territory, an explicit
+aggregation strategy decides the value — `first`, `unique` (the default:
+scalar if they agree, sorted list if they do not), `list`, `count`, `sum`,
+`min`, `max` or `discard` — configurable per field with `--agg
+field:strategy`, so a real conflict stays visible instead of being resolved
+to an arbitrary pick. Output formats are GeoJSON, TopoJSON or a
+metadata-only CSV; `--preset powerbi` simplifies geometry and trims
+`source_values` for a smaller, Power BI-ready file while keeping stable
+`territory_id`s. `tinytiles territory validate` reports unmatched/duplicate
+mapping keys, invalid geometries and likely overlaps as machine-readable
+JSON; `tinytiles territory inspect` summarizes any Polygon/MultiPolygon
+GeoJSON file, including its own output. See
+[examples/territory](examples/territory/README.md) for worked sales,
+field-service and delivery-logistics scenarios over the same mapping file.
+
+The dissolve itself cancels directed edges shared by two touching polygons in
+the same group rather than running a general polygon-boolean engine — correct
+and dependency-free for the common case (postcode/admin boundaries that tile
+the plane), not a substitute for one when input in the same group genuinely
+overlaps (`validate`'s overlap check exists to surface that case instead).
 
 ## `.ttiles` artifact contract
 
@@ -579,9 +649,18 @@ dropping in-flight requests.
 The standalone server intentionally has no authentication, authorization, rate
 limiting or deployment configuration. It is a correct artifact-serving binary,
 not a replacement for an application's edge policy. It exposes XYZ tiles at
-`/tiles/{z}/{x}/{y}.{format}`, TileJSON at `/tilejson.json`, metadata at
+`/tiles/{z}/{x}/{y}.{format}`, TileJSON at `/tilejson.json`, a MapLibre GL
+style at `/style.json` (paint rules generated for whichever `vector_layers`
+the dataset actually declares — water/landcover/building/transportation/
+postal_code — or a raster style for a raster tileset), metadata at
 `/metadata`, and the browser-safe revisioned TMS sync protocol at
-`/sync/manifest.json`. The standard MBTiles `format` metadata is translated to
+`/sync/manifest.json`. Passing `-postcodes region.postcodes.geojson` (the
+sidecar `tinytiles build --postal-codes` writes) additionally enables
+`GET /postcode/{code}` (full boundary lookup), `GET /postcode/search?q=`
+(prefix/substring search) and `GET /postcode/at?lon=&lat=` (reverse lookup —
+which postcode contains this coordinate); all three are unregistered, not
+just empty, when no postcode index is configured. The standard MBTiles
+`format` metadata is translated to
 the matching HTTP representation: `pbf`/`mvt` serves
 `application/vnd.mapbox-vector-tile` at `.mvt`, while aerial and raster sources
 using `png`, `jpg`/`jpeg`, `webp`, `avif`, `gif`, `tif`/`tiff`, `svg`, `json`

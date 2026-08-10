@@ -15,8 +15,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Karte-Bayern/tinyTiles/v2/internal/geo"
-	"github.com/Karte-Bayern/tinyTiles/v2/internal/minigen"
+	tinytiles "github.com/Karte-Bayern/tinyTiles/v2"
 	tiles "github.com/SimonWaldherr/tinySQL/tiles"
 )
 
@@ -103,6 +102,20 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "tinytiles build: --compact requires schema auto or normalized; schema flat would discard payload deduplication")
 		return 2
 	}
+	generatorName := strings.TrimSpace(*generator)
+	if generatorName == "" {
+		// The built-in generator streams tiles directly into the artifact
+		// (see BuildPBF); it never produces a real, standalone MBTiles file
+		// for --compact to deduplicate or --mbtiles-out to persist.
+		if *compact {
+			fmt.Fprintln(stderr, "tinytiles build: --compact requires an external --generator; the built-in generator has no MBTiles source to deduplicate")
+			return 2
+		}
+		if *mbtilesOut != "" {
+			fmt.Fprintln(stderr, "tinytiles build: --mbtiles-out requires an external --generator; the built-in generator never produces a real MBTiles file")
+			return 2
+		}
+	}
 	if *batch < 0 || *memory <= 0 || *reserve < 0 {
 		fmt.Fprintln(stderr, "tinytiles build: batch must be zero (automatic) or positive; max-memory must be positive; min-free must not be negative")
 		return 2
@@ -125,6 +138,49 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "tinytiles build: %v\n", err)
 			return 2
 		}
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	if generatorName == "" {
+		// The built-in generator delegates to BuildPBF, which streams
+		// straight into the artifact through tinySQL's tile-stream importer
+		// (tiles.ImportTiles) instead of a real MBTiles database, so none of
+		// the work-dir/mbtiles staging below applies to this path. Its
+		// Progress callback below reports "phase=generate" itself.
+		fmt.Fprintln(stdout, "generator=tinytiles-minimal")
+		built, err := tinytiles.BuildPBF(ctx, tinytiles.PBFBuildOptions{
+			PBFInputs:       pbfInputs,
+			ArtifactPath:    fs.Arg(1),
+			MinZoom:         *minZoom,
+			MaxZoom:         *maxZoom,
+			Concurrency:     *concurrency,
+			PostalCodes:     *postalCodes,
+			Schema:          artifactSchema,
+			BatchSize:       *batch,
+			MaxMemoryBytes:  *memory,
+			MinFreeBytes:    *reserve,
+			ReplaceExisting: *replace,
+			Progress: func(progress tinytiles.PBFBuildProgress) {
+				fmt.Fprintf(stdout, "phase=%s\n", progress.Phase)
+			},
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "tinytiles build: built-in generation failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "road-features=%d tiles=%d bounds=%.6f,%.6f,%.6f,%.6f\n", built.RoadFeatures, built.GeneratedTiles,
+			built.Bounds.MinLon, built.Bounds.MinLat, built.Bounds.MaxLon, built.Bounds.MaxLat)
+		fmt.Fprintf(stdout, "artifact=%s schema=%s\n", built.ArtifactPath, built.Info.Schema)
+		if built.PostalCodeCount > 0 {
+			fmt.Fprintf(stdout, "postal-codes=%d postcodes-geojson=%s\n", built.PostalCodeCount, built.PostalCodesPath)
+		}
+		return 0
+	}
+	if *postalCodes {
+		fmt.Fprintln(stderr, "tinytiles build: --postal-codes requires the built-in generator (no --generator)")
+		return 2
 	}
 
 	parent := strings.TrimSpace(*workDir)
@@ -159,52 +215,26 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	options.MBTiles = mbtiles
 	options.ShardDir = filepath.Join(work, "shards")
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
 	fmt.Fprintln(stdout, "phase=generate")
-	var provenance map[string]any
-	var postalFeatures []minigen.PostalFeature
-	if generatorName := strings.TrimSpace(*generator); generatorName == "" {
-		fmt.Fprintln(stdout, "generator=tinytiles-minimal")
-		result, err := minigen.Build(ctx, minigen.Config{
-			PBFInputs:   pbfInputs,
-			Output:      mbtiles,
-			MinZoom:     *minZoom,
-			MaxZoom:     *maxZoom,
-			Concurrency: *concurrency,
-			PostalCodes: *postalCodes,
-		})
-		if err != nil {
-			fmt.Fprintf(stderr, "tinytiles build: built-in generation failed: %v\n", err)
-			return 1
-		}
-		fmt.Fprintf(stdout, "road-features=%d tiles=%d bounds=%s\n", result.Roads, result.Tiles, result.Bounds.String())
-		postalFeatures = result.PostalCodes
-		provenance, err = options.builtinProvenance()
-	} else if *postalCodes {
-		fmt.Fprintln(stderr, "tinytiles build: --postal-codes requires the built-in generator (no --generator)")
+	generatorPath, lookupErr := exec.LookPath(generatorName)
+	if lookupErr != nil {
+		fmt.Fprintf(stderr, "tinytiles build: generator %q not found: %v\n", generatorName, lookupErr)
 		return 2
-	} else {
-		generatorPath, lookupErr := exec.LookPath(generatorName)
-		if lookupErr != nil {
-			fmt.Fprintf(stderr, "tinytiles build: generator %q not found: %v\n", generatorName, lookupErr)
-			return 2
-		}
-		generatorArgs := options.args()
-		fmt.Fprintf(stdout, "generator=%s\n", generatorPath)
-		fmt.Fprintf(stdout, "generator-args=%s\n", quoteArguments(generatorArgs))
-		command := exec.CommandContext(ctx, generatorPath, generatorArgs...)
-		command.Stdout, command.Stderr = stdout, stderr
-		if err := command.Run(); err != nil {
-			if ctx.Err() != nil {
-				fmt.Fprintf(stderr, "tinytiles build: generation cancelled: %v\n", ctx.Err())
-			} else {
-				fmt.Fprintf(stderr, "tinytiles build: generator failed: %v\n", err)
-			}
-			return 1
-		}
-		provenance, err = options.provenance(generatorPath)
 	}
+	generatorArgs := options.args()
+	fmt.Fprintf(stdout, "generator=%s\n", generatorPath)
+	fmt.Fprintf(stdout, "generator-args=%s\n", quoteArguments(generatorArgs))
+	command := exec.CommandContext(ctx, generatorPath, generatorArgs...)
+	command.Stdout, command.Stderr = stdout, stderr
+	if err := command.Run(); err != nil {
+		if ctx.Err() != nil {
+			fmt.Fprintf(stderr, "tinytiles build: generation cancelled: %v\n", ctx.Err())
+		} else {
+			fmt.Fprintf(stderr, "tinytiles build: generator failed: %v\n", err)
+		}
+		return 1
+	}
+	provenance, err := options.provenance(generatorPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "tinytiles build: collect PBF provenance: %v\n", err)
 		return 1
@@ -224,40 +254,7 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	if *mbtilesOut != "" {
 		fmt.Fprintf(stdout, "mbtiles=%s\n", mbtiles)
 	}
-	if len(postalFeatures) > 0 {
-		sidecarPath, err := writePostalCodesSidecar(fs.Arg(1), postalFeatures)
-		if err != nil {
-			fmt.Fprintf(stderr, "tinytiles build: %v\n", err)
-			return 1
-		}
-		fmt.Fprintf(stdout, "postal-codes=%d postcodes-geojson=%s\n", len(postalFeatures), sidecarPath)
-	}
 	return 0
-}
-
-// writePostalCodesSidecar writes assembled postal-code boundaries as a
-// standalone GeoJSON FeatureCollection next to the published artifact —
-// directly usable as `tinytiles territory --input`.
-func writePostalCodesSidecar(artifactPath string, features []minigen.PostalFeature) (string, error) {
-	geoFeatures := make([]geo.Feature, len(features))
-	for i, f := range features {
-		properties := map[string]any{"postcode": f.Code}
-		if f.Name != "" {
-			properties["name"] = f.Name
-		}
-		geoFeatures[i] = geo.Feature{Properties: properties, Geometry: f.Geometry}
-	}
-	data, err := geo.WriteFeatureCollection(geoFeatures)
-	if err != nil {
-		return "", fmt.Errorf("encode postal code sidecar: %w", err)
-	}
-	dir, base := filepath.Split(filepath.Clean(artifactPath))
-	base = strings.TrimSuffix(base, filepath.Ext(base))
-	path := filepath.Join(dir, base+".postcodes.geojson")
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return "", fmt.Errorf("write postal code sidecar: %w", err)
-	}
-	return path, nil
 }
 
 func (o externalGeneratorOptions) builtinProvenance() (map[string]any, error) {

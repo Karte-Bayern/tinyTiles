@@ -22,12 +22,21 @@ ohne SQLite sinnvoll ist.
 - atomare Veröffentlichung von `.ttiles` und vollständige Prüfung nach dem
   Schreiben;
 - selbstständige OSM-PBF → MBTiles → `.ttiles`-Erzeugung mit einer kompakten,
-  straßenorientierten Vektorschicht; reichhaltigere kompatible Erzeuger bleiben
-  optional;
+  straßenorientierten Vektorschicht, einer optionalen `postal_code`-
+  Grenzschicht aus `boundary=postal_code`-Relationen und Visvalingam-Whyatt-
+  Geometrievereinfachung (im Stil von mapshaper.org); reichhaltigere
+  kompatible Erzeuger bleiben optional;
 - ein importierbares, nebenläufiges `Dataset`, ein einhängbarer HTTP-Server
   und ein kleines eigenständiges Serverprogramm mit automatischer Ableitung von
-  Vektor-/Raster-MIME-Typen und URL-Endungen sowie dauerhaften Caches für
-  native Clients und Browser-IndexedDB;
+  Vektor-/Raster-MIME-Typen und URL-Endungen, einem automatisch erzeugten
+  MapLibre-GL-Style unter `/style.json`, einer optionalen Postleitzahl-Suche/
+  Rückwärtssuche sowie dauerhaften Caches für native Clients und
+  Browser-IndexedDB;
+- ein generischer Gebietsersteller (`tinytiles territory`), der Postleitzahlen
+  oder beliebige andere Polygondaten — per Präfix oder einer frei wählbaren
+  CSV/JSON-Zuordnung — zu aufgelösten Vertriebs-, Außendienst- oder
+  Liefergebieten gruppiert, mit GeoJSON-/TopoJSON-/CSV-Export und einer
+  Power-BI-Voreinstellung;
 - reproduzierbare Tests, Race Checks, WASM-Kompilierung, Benchmarks und
   Beispiele.
 
@@ -62,6 +71,10 @@ schnellen, validierten Lesepfad bekommt, sobald man es bereits hat.
   deck.gl konsumieren alle das TileJSON, das tinyTiles unter
   `/tilejson.json` ausliefert, einschließlich `vector_layers`/`tilestats`
   für ein Vektor-Tileset und `encoding` für eine Raster-DEM-Geländequelle.
+  `/style.json` geht einen Schritt weiter und liefert einen einsatzbereiten
+  MapLibre-GL-Style — mit Zeichenregeln für genau die Schichten, die das
+  Dataset tatsächlich enthält —, geprüft durch das Laden in einer echten
+  MapLibre-GL-JS-Karte während der Entwicklung, nicht nur per JSON-Schema.
 - **[QGIS](https://qgis.org)** kann einen tinyTiles-Endpunkt direkt als
   Vektor- oder Raster-Kachelebene über seinen TileJSON-/XYZ-Verbindungsdialog
   hinzufügen — nützlich, um ein veröffentlichtes Artefakt ohne eigenen
@@ -358,6 +371,7 @@ tinytiles validate   dataset.ttiles/
 tinytiles inspect    dataset.ttiles/
 tinytiles tile       dataset.ttiles/ z x y
 tinytiles benchmark  --source source.mbtiles --artifact dataset.ttiles/
+tinytiles territory  --input features.geojson --output out.geojson
 tinytiles version
 tinytiles-server     -artifact dataset.ttiles/ -dataset region
 ```
@@ -469,6 +483,71 @@ Mehrere PBF-Dateien werden durch Kommata getrennt. `--min-lat`, `--min-lon`,
 Das mit Prüfsummen versehene Artefaktmanifest hält portable
 PBF-Herkunft fest (Eingabedateinamen/-größen und Generator-Konfiguration), nie
 maschinenlokale absolute Pfade.
+
+Eine Ausnahme von der straßenorientierten Vektorschicht:
+`boundary=postal_code`-Relationen. Mit `--postal-codes` werden sie zusammengesetzt
+(aufgeteilte Way-Segmente verbunden, `outer`/`inner`-Rollen berücksichtigt,
+Löcher der richtigen Außenkontur zugeordnet) und als `postal_code`-
+Vektorschicht sowie als `<dataset-basis>.postcodes.geojson`-Sidecar neben dem
+veröffentlichten Artefakt abgelegt — eine gewöhnliche GeoJSON-
+FeatureCollection, die auch als Eingabe für `tinytiles territory --input`
+(siehe [Gebietsbildung](#gebietsbildung)) oder für
+[mapshaper.org](https://mapshaper.org) taugt:
+
+```bash
+./dist/tinytiles build --postal-codes \
+  --minzoom 8 --maxzoom 14 \
+  region.osm.pbf region.ttiles/
+```
+
+Wird dieses Artefakt mit `-postcodes region.postcodes.geojson` ausgeliefert
+(siehe [Offline-Kacheln ausliefern und synchronisieren](#offline-kacheln-ausliefern-und-synchronisieren)),
+steht zusätzlich eine Postleitzahl-Suche/Rückwärtssuche im Stil von
+suche-postleitzahl.org bereit.
+
+## Gebietsbildung
+
+`tinytiles territory` verwandelt Postleitzahl-Polygone, administrative
+Grenzen oder beliebige andere GeoJSON-Polygondaten in individuelle
+Geschäftsgebiete — Vertriebsregionen, Außendienstgebiete, Liefergebiete —,
+ohne vorauszusetzen, dass die Eingabe Postleitzahlen sind: Geometrien werden
+per Postleitzahl-Präfix oder per beliebiger Spalte einer externen CSV-/JSON-
+Zuordnung gruppiert, aufgelöst (berührende Polygone verschmelzen; unabhängige
+bleiben korrekt ein disjunktes `MultiPolygon`; Löcher bleiben erhalten) und
+anschließend exportiert.
+
+```bash
+tinytiles territory \
+  --input postcodes.geojson \
+  --mapping territories.csv \
+  --group-by employee \
+  --simplify 50m \
+  --output sales-territories.geojson
+```
+
+Widersprechen sich Quelldatensätze innerhalb eines Gebiets bei einem Feld,
+entscheidet eine explizite Aggregationsstrategie über den Wert — `first`,
+`unique` (Standard: Skalar bei Übereinstimmung, sortierte Liste sonst),
+`list`, `count`, `sum`, `min`, `max` oder `discard`, konfigurierbar je Feld
+über `--agg feld:strategie`, damit ein echter Konflikt sichtbar bleibt statt
+willkürlich aufgelöst zu werden. Ausgabeformate sind GeoJSON, TopoJSON oder
+eine reine Metadaten-CSV; `--preset powerbi` vereinfacht die Geometrie und
+entfernt `source_values` für eine kleinere, Power-BI-taugliche Datei bei
+stabilen `territory_id`s. `tinytiles territory validate` meldet nicht
+zugeordnete/doppelte Zuordnungsschlüssel, ungültige Geometrien und mögliche
+Überlappungen als maschinenlesbares JSON; `tinytiles territory inspect`
+fasst jede Polygon-/MultiPolygon-GeoJSON-Datei zusammen, auch die eigene
+Ausgabe. Siehe [examples/territory](examples/territory/README.md) für
+durchgespielte Vertriebs-, Außendienst- und Liefer-Logistik-Szenarien über
+dieselbe Zuordnungsdatei.
+
+Die Auflösung selbst annulliert gegenläufige gerichtete Kanten, die zwei sich
+berührende Polygone derselben Gruppe teilen, statt eine allgemeine
+Polygon-Boolesche-Engine zu betreiben — korrekt und ohne Zusatzabhängigkeit
+für den üblichen Fall (Postleitzahl-/Verwaltungsgrenzen, die die Fläche
+lückenlos kacheln), aber kein Ersatz dafür, wenn sich Eingaben derselben
+Gruppe tatsächlich überlappen (dafür existiert die Überlappungsprüfung von
+`validate`).
 
 ## `.ttiles`-Artefaktvertrag
 
@@ -630,9 +709,18 @@ Der eigenständige Server enthält absichtlich weder Authentisierung,
 Autorisierung, Ratenbegrenzung noch Deployment-Konfiguration. Er ist ein
 korrektes Artefakt-Auslieferungsprogramm, kein Ersatz für die Edge-Strategie
 einer Anwendung. Er stellt XYZ-Kacheln unter `/tiles/{z}/{x}/{y}.{format}`,
-TileJSON unter `/tilejson.json`, Metadaten unter `/metadata` und das
+TileJSON unter `/tilejson.json`, einen MapLibre-GL-Style unter `/style.json`
+(Zeichenregeln für genau die `vector_layers`, die das Dataset tatsächlich
+deklariert — water/landcover/building/transportation/postal_code — oder ein
+Raster-Style für ein Raster-Tileset), Metadaten unter `/metadata` und das
 browser-sichere, versionsbezogene TMS-Synchronisierungsprotokoll unter
-`/sync/manifest.json` bereit. Die MBTiles-Standardmetadaten `format` werden
+`/sync/manifest.json` bereit. Mit `-postcodes region.postcodes.geojson` (dem
+Sidecar, den `tinytiles build --postal-codes` schreibt) kommen zusätzlich
+`GET /postcode/{code}` (vollständige Grenz-Abfrage), `GET
+/postcode/search?q=` (Präfix-/Teilstring-Suche) und `GET
+/postcode/at?lon=&lat=` (Rückwärtssuche — welche Postleitzahl enthält diese
+Koordinate) hinzu; ohne konfigurierten Postleitzahl-Index sind alle drei
+Routen nicht registriert, nicht nur leer. Die MBTiles-Standardmetadaten `format` werden
 in die passende HTTP-Repräsentation übersetzt: `pbf`/`mvt` wird als
 `application/vnd.mapbox-vector-tile` unter `.mvt` ausgeliefert, während
 Luftbild- und Rasterquellen mit `png`, `jpg`/`jpeg`, `webp`, `avif`, `gif`,

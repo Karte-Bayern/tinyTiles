@@ -507,12 +507,17 @@ func (s *Server) serveTMSSync(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	gen := s.gen.Load()
-	parts := strings.Split(strings.TrimPrefix(path.Clean(request.URL.Path), "/tiles/"), "/")
+	raw := path.Clean(request.URL.Path)
+	parts := strings.Split(strings.TrimPrefix(raw, "/tiles/"), "/")
 	if len(parts) != 4 || parts[0] != gen.revision {
 		http.NotFound(w, request)
 		return
 	}
-	key, err := parseTMSParts(parts[1:])
+	yPart := parts[3]
+	if dot := strings.LastIndexByte(yPart, '.'); dot >= 0 {
+		yPart = yPart[:dot]
+	}
+	key, err := parseTMSParts([]string{parts[1], parts[2], yPart})
 	if err != nil {
 		http.Error(w, "invalid TMS tile coordinate", http.StatusBadRequest)
 		return
@@ -603,15 +608,19 @@ func loadTile(ctx context.Context, gen *generation, key tiles.Key) ([]byte, stri
 		return data, checksum, true, nil
 	}
 	checksum, checksumFound := gen.tileCache.checksum(key)
-	tile, found, err := gen.dataset.LookupTMS(ctx, key)
+	var data []byte
+	found, err := gen.dataset.LookupTMSFunc(ctx, key, func(tile tiles.Tile) error {
+		data = tile.Data
+		if !checksumFound {
+			checksum = offline.Checksum(tile.Data)
+		}
+		return nil
+	})
 	if err != nil || !found {
 		return nil, "", found, err
 	}
-	if !checksumFound {
-		checksum = offline.Checksum(tile.Data)
-	}
-	gen.tileCache.put(key, tile.Data, checksum)
-	return tile.Data, checksum, true, nil
+	gen.tileCache.put(key, data, checksum)
+	return data, checksum, true, nil
 }
 
 func writeTileHeaders(w http.ResponseWriter, gen *generation, data []byte, checksum string, browserTile bool) {

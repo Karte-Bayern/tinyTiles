@@ -189,12 +189,29 @@ func (d *Dataset) LookupTMS(ctx context.Context, key tiles.Key) (tiles.Tile, boo
 	if err := key.Validate(); err != nil {
 		return tiles.Tile{}, false, err
 	}
+	var tile tiles.Tile
+	found, err := d.LookupTMSFunc(ctx, key, func(result tiles.Tile) error {
+		tile = result
+		return nil
+	})
+	return tile, found, err
+}
+
+// LookupTMSFunc performs one exact MBTiles/TMS tile lookup and passes the
+// caller-owned tile directly to fn without allocating a second wrapper.
+func (d *Dataset) LookupTMSFunc(ctx context.Context, key tiles.Key, fn func(tiles.Tile) error) (bool, error) {
+	if err := key.Validate(); err != nil {
+		return false, err
+	}
+	if fn == nil {
+		return false, fmt.Errorf("tinytiles: callback is required")
+	}
 	reader, err := d.acquire(ctx)
 	if err != nil {
-		return tiles.Tile{}, false, err
+		return false, err
 	}
 	defer d.release(reader)
-	return reader.Lookup(ctx, key)
+	return reader.LookupFunc(ctx, key, fn)
 }
 
 // LookupXYZ performs one slippy-map XYZ tile lookup. The stored artifact
@@ -205,12 +222,21 @@ func (d *Dataset) LookupXYZ(ctx context.Context, z, x, yXYZ int) (tiles.Tile, bo
 		return tiles.Tile{}, false, err
 	}
 	key.Y = (1 << z) - 1 - yXYZ
-	reader, err := d.acquire(ctx)
-	if err != nil {
-		return tiles.Tile{}, false, err
+	return d.LookupTMS(ctx, key)
+}
+
+// LookupXYZFunc performs one slippy-map XYZ tile lookup and passes the caller-owned
+// tile directly to fn without allocating a second wrapper.
+func (d *Dataset) LookupXYZFunc(ctx context.Context, z, x, yXYZ int, fn func(tiles.Tile) error) (bool, error) {
+	key := tiles.Key{Z: z, X: x, Y: yXYZ}
+	if err := key.Validate(); err != nil {
+		return false, err
 	}
-	defer d.release(reader)
-	return reader.Lookup(ctx, key)
+	key.Y = (1 << z) - 1 - yXYZ
+	if fn == nil {
+		return false, fmt.Errorf("tinytiles: callback is required")
+	}
+	return d.LookupTMSFunc(ctx, key, fn)
 }
 
 // GetTileXYZ is a migration-friendly adapter for servers with the established

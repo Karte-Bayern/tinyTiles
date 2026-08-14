@@ -143,6 +143,13 @@ func TestHandlerServesXYZAndRevisionedTMS(t *testing.T) {
 	if got := tmsResponse.Header().Get(offline.HeaderTileContentEncoding); got != "gzip" {
 		t.Fatalf("TMS raw encoding = %q", got)
 	}
+
+	tmsRequest = httptest.NewRequest(http.MethodGet, "https://tiles.example/sync/tiles/"+manifest.Revision+"/2/1/2.mvt", nil)
+	tmsResponse = httptest.NewRecorder()
+	server.Handler().ServeHTTP(tmsResponse, tmsRequest)
+	if tmsResponse.Code != http.StatusOK || string(tmsResponse.Body.Bytes()) != string([]byte{1, 2, 3}) {
+		t.Fatalf("TMS response with extension = %d %q", tmsResponse.Code, tmsResponse.Body.Bytes())
+	}
 }
 
 func TestHandlerServesRasterTilesUsingMBTilesFormat(t *testing.T) {

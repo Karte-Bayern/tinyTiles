@@ -218,6 +218,49 @@ func TestDatasetCloseDrainsHotReader(t *testing.T) {
 	}
 }
 
+func TestDatasetLookupFuncPathAndCallbackBehavior(t *testing.T) {
+	reader := &memoryReader{tiles: map[tiles.Key][]byte{{Z: 2, X: 1, Y: 2}: {1, 2, 3}}}
+	dataset := &Dataset{readers: make(chan tiles.Reader, 1), done: make(chan struct{})}
+	dataset.readers <- reader
+
+	var got tiles.Tile
+	found, err := dataset.LookupTMSFunc(context.Background(), tiles.Key{Z: 2, X: 1, Y: 2}, func(result tiles.Tile) error {
+		got = result
+		return nil
+	})
+	if err != nil || !found || got.Key != (tiles.Key{Z: 2, X: 1, Y: 2}) || string(got.Data) != string([]byte{1, 2, 3}) {
+		t.Fatalf("LookupTMSFunc = %v, %#v", found, got)
+	}
+	_, err = dataset.LookupTMSFunc(context.Background(), tiles.Key{Z: 2, X: 1, Y: 2}, nil)
+	if err == nil {
+		t.Fatal("LookupTMSFunc accepted nil callback")
+	}
+	gotCallback := errors.New("callback")
+	_, err = dataset.LookupXYZFunc(context.Background(), 2, 1, 1, func(result tiles.Tile) error {
+		if result.Key != (tiles.Key{Z: 2, X: 1, Y: 2}) {
+			t.Fatalf("lookup callback key = %#v, want %#v", result.Key, tiles.Key{Z: 2, X: 1, Y: 2})
+		}
+		return gotCallback
+	})
+	if !errors.Is(err, gotCallback) {
+		t.Fatalf("LookupXYZFunc error = %v, want %v", err, gotCallback)
+	}
+	missingCalled := false
+	found, err = dataset.LookupTMSFunc(context.Background(), tiles.Key{Z: 2, X: 2, Y: 3}, func(_ tiles.Tile) error {
+		missingCalled = true
+		return nil
+	})
+	if found || err != nil || missingCalled {
+		t.Fatalf("missing tile lookup = found=%t err=%v called=%t", found, err, missingCalled)
+	}
+	if err := dataset.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dataset.Metadata(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("lookup after Close = %v, want ErrClosed", err)
+	}
+}
+
 func waitForDatasetClose(t *testing.T, dataset *Dataset) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)

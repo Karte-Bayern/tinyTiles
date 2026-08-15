@@ -41,12 +41,13 @@ func BuildPBF(ctx context.Context, options PBFBuildOptions) (PBFBuildResult, err
 
 	emitPBFBuildProgress(resolved.Progress, PBFBuildProgress{Phase: "generate"})
 	generated, err := minigen.Build(ctx, minigen.Config{
-		PBFInputs:   resolved.PBFInputs,
-		Output:      filepath.Join(work, "source.tiles"),
-		MinZoom:     resolved.MinZoom,
-		MaxZoom:     resolved.MaxZoom,
-		Concurrency: resolved.Concurrency,
-		PostalCodes: resolved.PostalCodes,
+		PBFInputs:         resolved.PBFInputs,
+		Output:            filepath.Join(work, "source.tiles"),
+		MinZoom:           resolved.MinZoom,
+		MaxZoom:           resolved.MaxZoom,
+		Concurrency:       resolved.Concurrency,
+		SimplifyTolerance: resolved.SimplifyTolerance,
+		PostalCodes:       resolved.PostalCodes,
 	})
 	if err != nil {
 		return PBFBuildResult{}, fmt.Errorf("tinytiles: generate PBF tiles: %w", err)
@@ -208,11 +209,21 @@ func resolvePBFBuildOptions(options PBFBuildOptions) (resolvedPBFBuildOptions, e
 			return resolvedPBFBuildOptions{}, err
 		}
 	}
+	presetMinZoom, presetMaxZoom, presetTolerance, _, err := ResolvePreset(options.Preset)
+	if err != nil {
+		return resolvedPBFBuildOptions{}, fmt.Errorf("tinytiles: %w", err)
+	}
 	if options.MinZoom == 0 && options.MaxZoom == 0 {
-		options.MinZoom, options.MaxZoom = DefaultPBFBuildMinZoom, DefaultPBFBuildMaxZoom
+		options.MinZoom, options.MaxZoom = presetMinZoom, presetMaxZoom
+	}
+	if options.SimplifyTolerance == 0 {
+		options.SimplifyTolerance = presetTolerance
 	}
 	if options.MinZoom < 0 || options.MaxZoom < options.MinZoom || options.MaxZoom > 22 {
 		return resolvedPBFBuildOptions{}, fmt.Errorf("tinytiles: invalid PBF zoom range %d..%d", options.MinZoom, options.MaxZoom)
+	}
+	if options.SimplifyTolerance < 0 {
+		return resolvedPBFBuildOptions{}, errors.New("tinytiles: PBF simplify tolerance must not be negative")
 	}
 	if options.Concurrency < 0 {
 		return resolvedPBFBuildOptions{}, errors.New("tinytiles: PBF concurrency must not be negative")
@@ -385,9 +396,11 @@ func pbfBuildProvenance(options resolvedPBFBuildOptions) (map[string]any, error)
 			"executable": "builtin",
 		},
 		"generator_config": map[string]any{
-			"minzoom": options.MinZoom,
-			"maxzoom": options.MaxZoom,
-			"layers":  []string{"water", "landcover", "building", "transportation"},
+			"minzoom":            options.MinZoom,
+			"maxzoom":            options.MaxZoom,
+			"preset":             string(options.Preset),
+			"simplify_tolerance": options.SimplifyTolerance,
+			"layers":             []string{"water", "landcover", "building", "transportation"},
 		},
 	}, nil
 }

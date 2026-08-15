@@ -14,13 +14,16 @@ const (
 	geometryPolygon = 3
 	tileExtent      = 4096
 
-	// simplifyTolerance is a Visvalingam-Whyatt effective-area threshold in
-	// squared tile pixels (mapshaper.org's default simplification method).
-	// It is applied post-projection, in the tile's fixed 4096-unit extent, so
-	// the same tolerance is imperceptible at every zoom while discarding
-	// proportionally more geometry at low zooms, where each tile pixel spans
-	// far more ground distance.
-	simplifyTolerance = 4.0
+	// DefaultSimplifyTolerance is a Visvalingam-Whyatt effective-area
+	// threshold in squared tile pixels (mapshaper.org's default
+	// simplification method), used when Config.SimplifyTolerance is zero or
+	// negative. It is applied post-projection, in the tile's fixed
+	// 4096-unit extent, so the same tolerance is imperceptible at every zoom
+	// while discarding proportionally more geometry at low zooms, where each
+	// tile pixel spans far more ground distance. A larger tolerance produces
+	// smaller, coarser tiles; a smaller one preserves more detail at the
+	// cost of size.
+	DefaultSimplifyTolerance = 4.0
 )
 
 type feature struct {
@@ -37,10 +40,10 @@ type ring struct {
 	hole   bool
 }
 
-func encodeTile(key tileKey, layers map[string][]feature) ([]byte, error) {
+func encodeTile(key tileKey, layers map[string][]feature, tolerance float64) ([]byte, error) {
 	var tile []byte
 	for _, name := range []string{"water", "landcover", "building", "transportation", "postal_code"} {
-		if data := encodeLayer(name, key, layers[name]); len(data) > 0 {
+		if data := encodeLayer(name, key, layers[name], tolerance); len(data) > 0 {
 			tile = appendMessage(tile, 3, data)
 		}
 	}
@@ -58,7 +61,7 @@ func encodeTile(key tileKey, layers map[string][]feature) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func encodeLayer(name string, key tileKey, features []feature) []byte {
+func encodeLayer(name string, key tileKey, features []feature, tolerance float64) []byte {
 	if len(features) == 0 {
 		return nil
 	}
@@ -67,7 +70,7 @@ func encodeLayer(name string, key tileKey, features []feature) []byte {
 	var keyList, valueList []string
 	var encoded [][]byte
 	for _, f := range features {
-		geom := encodeGeometry(f, key)
+		geom := encodeGeometry(f, key, tolerance)
 		if len(geom) == 0 {
 			continue
 		}
@@ -126,16 +129,16 @@ func encodeLayer(name string, key tileKey, features []feature) []byte {
 
 func encodeValue(s string) []byte { return appendMessage(nil, 1, []byte(s)) }
 
-func encodeGeometry(f feature, key tileKey) []byte {
+func encodeGeometry(f feature, key tileKey, tolerance float64) []byte {
 	if f.kind == geometryPolygon && len(f.rings) > 0 {
-		return encodeRings(f.rings, key)
+		return encodeRings(f.rings, key, tolerance)
 	}
 	points := make([][2]int, 0, len(f.points))
 	for _, p := range f.points {
 		points = append(points, projectPoint(p, key))
 	}
 	if f.kind == geometryLine {
-		points = simplifyPixels(points, simplifyTolerance, false)
+		points = simplifyPixels(points, tolerance, false)
 		points = clipLine(points)
 		if len(points) < 2 {
 			return nil
@@ -146,7 +149,7 @@ func encodeGeometry(f feature, key tileKey) []byte {
 		if len(points) > 1 && points[0] == points[len(points)-1] {
 			points = points[:len(points)-1]
 		}
-		points = simplifyPixels(points, simplifyTolerance, true)
+		points = simplifyPixels(points, tolerance, true)
 		points = clipPolygon(points)
 		if len(points) < 3 {
 			return nil
@@ -162,7 +165,7 @@ func encodeGeometry(f feature, key tileKey) []byte {
 // (exterior vs. hole) comes entirely from its winding direction, so emission
 // order does not need to pair a hole with its containing exterior ring — a
 // point-in-tile rasterizer resolves that from the accumulated windings.
-func encodeRings(rings []ring, key tileKey) []byte {
+func encodeRings(rings []ring, key tileKey, tolerance float64) []byte {
 	var out []byte
 	last := [2]int{}
 	wrote := false
@@ -174,7 +177,7 @@ func encodeRings(rings []ring, key tileKey) []byte {
 		if len(points) > 1 && points[0] == points[len(points)-1] {
 			points = points[:len(points)-1]
 		}
-		points = simplifyPixels(points, simplifyTolerance, true)
+		points = simplifyPixels(points, tolerance, true)
 		points = clipPolygon(points)
 		if len(points) < 3 {
 			continue

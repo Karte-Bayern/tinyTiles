@@ -44,11 +44,26 @@ func main() {
 		tileCache   = flag.Int64("tile-cache-bytes", server.DefaultTileCacheBytes, "immutable tile cache budget in bytes (-1 disables)")
 		demEncoding = flag.String("dem-encoding", "", "declare a raster tileset as elevation data: terrarium, mapbox or custom")
 		postcodes   = flag.String("postcodes", "", "optional postal-code boundary GeoJSON (the sidecar `tinytiles build --postal-codes` writes); enables /postcode/{code}, /postcode/search and /postcode/at")
+		preset      = flag.String("preset", "", "use-case preset ("+serverPresetNames+"); fills in -readers/-max-memory/-tile-cache-bytes and prefetch tuning you did not set explicitly")
 	)
 	flag.Parse()
 	if *showVersion {
 		fmt.Fprintln(os.Stdout, version)
 		return
+	}
+	resolvedPreset, err := resolveServerPreset(*preset)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tinytiles-server: %v\n", err)
+		os.Exit(2)
+	}
+	if !flagWasSet("readers") {
+		*readers = resolvedPreset.readers
+	}
+	if !flagWasSet("max-memory") {
+		*memory = resolvedPreset.maxMemory
+	}
+	if !flagWasSet("tile-cache-bytes") {
+		*tileCache = resolvedPreset.tileCacheBytes
 	}
 	if *artifact == "" || *datasetID == "" || *readers < 1 || *memory < 0 || *tileCache < -1 {
 		fmt.Fprintln(os.Stderr, "usage: tinytiles-server -artifact dataset.ttiles/ -dataset name [-addr :8080]")
@@ -65,6 +80,7 @@ func main() {
 	handler, err := server.New(server.Config{
 		Dataset: dataset, DatasetID: *datasetID, PublicBase: *publicBase, CORSOrigin: *corsOrigin,
 		TileCacheBytes: *tileCache, DEMEncoding: *demEncoding, PostcodeIndexPath: *postcodes,
+		PrefetchWorkers: resolvedPreset.prefetchWorkers, PrefetchQueue: resolvedPreset.prefetchQueue, PrefetchMaxTiles: resolvedPreset.prefetchMaxTiles,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -163,4 +179,18 @@ func min(left, right int) int {
 		return left
 	}
 	return right
+}
+
+// flagWasSet reports whether name was explicitly passed on the command line,
+// as opposed to only carrying its registered default value — the same
+// distinction cmd/tinytiles's flagWasSet makes for its own FlagSet, adapted
+// to this binary's use of the global flag.CommandLine.
+func flagWasSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }

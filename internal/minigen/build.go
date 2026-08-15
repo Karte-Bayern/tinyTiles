@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Config controls the self-contained PBF to tile-stream build. The generator
@@ -22,6 +23,12 @@ type Config struct {
 	MinZoom     int
 	MaxZoom     int
 	Concurrency int
+
+	// SimplifyTolerance is a Visvalingam-Whyatt effective-area threshold in
+	// squared tile pixels, applied post-projection (see DefaultSimplifyTolerance
+	// for the full explanation). Zero or negative selects
+	// DefaultSimplifyTolerance.
+	SimplifyTolerance float64
 
 	// PostalCodes adds a "postal_code" vector layer assembled from
 	// boundary=postal_code relations, and populates Result.PostalCodes. It
@@ -65,9 +72,13 @@ func (b *Bounds) add(point point) {
 }
 
 // Build turns one or more OSM PBF files into a sequential vector tile stream.
-// It collects renderable references, loads only their coordinates, then streams
-// the renderable ways once for every requested zoom. This avoids retaining every
-// PBF node while keeping the implementation small.
+// It collects renderable references, loads only their coordinates, then
+// decodes and classifies every renderable way exactly once — regardless of
+// how many zoom levels are requested — before projecting, simplifying and
+// encoding that in-memory feature list once per zoom. Earlier versions
+// re-scanned and re-decompressed every input file once per zoom level; that
+// full-file work is now paid at most three times total (node refs,
+// coordinates, features), however wide the zoom range is.
 func Build(ctx context.Context, cfg Config) (Result, error) {
 	if len(cfg.PBFInputs) == 0 {
 		return Result{}, fmt.Errorf("minigen: at least one PBF input is required")
@@ -81,6 +92,9 @@ func Build(ctx context.Context, cfg Config) (Result, error) {
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = runtime.GOMAXPROCS(0)
 	}
+	if cfg.SimplifyTolerance <= 0 {
+		cfg.SimplifyTolerance = DefaultSimplifyTolerance
+	}
 
 	refs, err := collectRenderableNodeRefs(ctx, cfg.PBFInputs, cfg.Concurrency)
 	if err != nil {
@@ -92,6 +106,11 @@ func Build(ctx context.Context, cfg Config) (Result, error) {
 	}
 	if bounds.MinLon > bounds.MaxLon {
 		return Result{}, fmt.Errorf("minigen: no renderable map features found in PBF input")
+	}
+
+	features, err := collectRenderableFeatures(ctx, cfg.PBFInputs, coords, cfg.Concurrency)
+	if err != nil {
+		return Result{}, err
 	}
 
 	var postalFeatures []PostalFeature
@@ -113,15 +132,12 @@ func Build(ctx context.Context, cfg Config) (Result, error) {
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
-		builders, roads, err := buildZoom(ctx, cfg.PBFInputs, coords, zoom, cfg.Concurrency)
-		if err != nil {
-			return Result{}, err
-		}
+		builders, roads := buildZoomFromFeatures(features, zoom, cfg.SimplifyTolerance)
 		result.Roads += roads
 		if len(postalFeatures) > 0 && zoom >= postalMinZoom {
-			addPostalFeatures(builders, zoom, postalFeatures)
+			addPostalFeatures(builders, zoom, postalFeatures, cfg.SimplifyTolerance)
 		}
-		written, err := writeZoom(stream, builders)
+		written, err := writeZoom(stream, builders, cfg.Concurrency)
 		if err != nil {
 			return Result{}, err
 		}
@@ -133,9 +149,60 @@ func Build(ctx context.Context, cfg Config) (Result, error) {
 	return result, nil
 }
 
+// scanInputsParallel runs scanOne once per input. With a single input (the
+// common case) it runs directly against the caller's ctx, preserving the
+// original sequential error-ordering behavior exactly. With more than one
+// input, each scanOne call runs in its own goroutine, bounded by concurrency,
+// writing to an independent result slot — no shared mutable state exists
+// during a scan, so merging happens only after every goroutine finishes. A
+// derived context is canceled as soon as any input errors, so sibling scans
+// stop promptly instead of running to completion after a failure.
+func scanInputsParallel[T any](ctx context.Context, inputs []string, concurrency int, scanOne func(context.Context, string) (T, error)) ([]T, error) {
+	if len(inputs) <= 1 {
+		out := make([]T, 0, len(inputs))
+		for _, input := range inputs {
+			v, err := scanOne(ctx, input)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, v)
+		}
+		return out, nil
+	}
+
+	groupCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	out := make([]T, len(inputs))
+	errs := make([]error, len(inputs))
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for i, input := range inputs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, input string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			out[i], errs[i] = scanOne(groupCtx, input)
+			if errs[i] != nil {
+				cancel()
+			}
+		}(i, input)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 func collectRenderableNodeRefs(ctx context.Context, inputs []string, concurrency int) (map[int64]struct{}, error) {
-	refs := make(map[int64]struct{})
-	for _, input := range inputs {
+	perInput, err := scanInputsParallel(ctx, inputs, concurrency, func(ctx context.Context, input string) (map[int64]struct{}, error) {
+		refs := make(map[int64]struct{})
 		err := scanPBF(ctx, input, concurrency, func(node *node, way *way) error {
 			if way == nil || !isRenderableWay(way) {
 				return nil
@@ -145,17 +212,28 @@ func collectRenderableNodeRefs(ctx context.Context, inputs []string, concurrency
 			}
 			return nil
 		})
-		if err != nil {
-			return nil, err
+		return refs, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	refs := make(map[int64]struct{})
+	for _, m := range perInput {
+		for id := range m {
+			refs[id] = struct{}{}
 		}
 	}
 	return refs, nil
 }
 
 func loadCoordinates(ctx context.Context, inputs []string, refs map[int64]struct{}, concurrency int) (map[int64]point, Bounds, error) {
-	coords := make(map[int64]point, len(refs))
-	bounds := Bounds{MinLon: math.Inf(1), MinLat: math.Inf(1), MaxLon: math.Inf(-1), MaxLat: math.Inf(-1)}
-	for _, input := range inputs {
+	type partial struct {
+		coords map[int64]point
+		bounds Bounds
+	}
+	perInput, err := scanInputsParallel(ctx, inputs, concurrency, func(ctx context.Context, input string) (partial, error) {
+		coords := make(map[int64]point)
+		bounds := Bounds{MinLon: math.Inf(1), MinLat: math.Inf(1), MaxLon: math.Inf(-1), MaxLat: math.Inf(-1)}
 		err := scanPBF(ctx, input, concurrency, func(node *node, way *way) error {
 			if node == nil {
 				return nil
@@ -168,9 +246,21 @@ func loadCoordinates(ctx context.Context, inputs []string, refs map[int64]struct
 			bounds.add(p)
 			return nil
 		})
-		if err != nil {
-			return nil, Bounds{}, err
+		return partial{coords, bounds}, err
+	})
+	if err != nil {
+		return nil, Bounds{}, err
+	}
+	coords := make(map[int64]point, len(refs))
+	bounds := Bounds{MinLon: math.Inf(1), MinLat: math.Inf(1), MaxLon: math.Inf(-1), MaxLat: math.Inf(-1)}
+	for _, part := range perInput {
+		for id, p := range part.coords {
+			coords[id] = p
 		}
+		bounds.MinLon = min(bounds.MinLon, part.bounds.MinLon)
+		bounds.MinLat = min(bounds.MinLat, part.bounds.MinLat)
+		bounds.MaxLon = max(bounds.MaxLon, part.bounds.MaxLon)
+		bounds.MaxLat = max(bounds.MaxLat, part.bounds.MaxLat)
 	}
 	return coords, bounds, nil
 }
@@ -178,47 +268,97 @@ func loadCoordinates(ctx context.Context, inputs []string, refs map[int64]struct
 type tileKey struct{ z, x, y int }
 
 type tileBuilder struct {
-	key    tileKey
-	layers map[string][]feature
+	key       tileKey
+	layers    map[string][]feature
+	tolerance float64
 }
 
-func buildZoom(ctx context.Context, inputs []string, coords map[int64]point, zoom, concurrency int) (map[tileKey]*tileBuilder, int, error) {
-	builders := make(map[tileKey]*tileBuilder)
-	roads := 0
-	for _, input := range inputs {
+// renderableFeature is a way's classification and WGS84 geometry, resolved
+// once from its PBF tags and node coordinates. It carries everything a later
+// per-zoom pass needs (layer, geometry kind, the zoom threshold it first
+// becomes visible at, and its properties) without touching the PBF file
+// again.
+type renderableFeature struct {
+	layer      string
+	kind       int
+	minZoom    int
+	line       []point
+	properties map[string]any
+}
+
+// collectRenderableFeatures decodes every way exactly once, classifies it via
+// roadClass/areaClass, and resolves its line/ring geometry from coords. The
+// resulting slice is then reused, in memory, for every zoom in Build's loop
+// — replacing what used to be a full PBF re-scan per zoom.
+func collectRenderableFeatures(ctx context.Context, inputs []string, coords map[int64]point, concurrency int) ([]renderableFeature, error) {
+	perInput, err := scanInputsParallel(ctx, inputs, concurrency, func(ctx context.Context, input string) ([]renderableFeature, error) {
+		var features []renderableFeature
 		err := scanPBF(ctx, input, concurrency, func(node *node, way *way) error {
 			if way == nil {
 				return nil
 			}
-			if class, minZoom, ok := roadClass(way.Tags); ok && zoom >= minZoom {
+			if class, minZoom, ok := roadClass(way.Tags); ok {
 				line := wayLine(coords, way.NodeIDs)
 				if len(line) >= 2 {
-					feature := feature{kind: geometryLine, points: line, properties: featureProperties(class, way.Tags, true)}
-					addFeature(builders, zoom, "transportation", feature)
-					roads++
+					features = append(features, renderableFeature{
+						layer:      "transportation",
+						kind:       geometryLine,
+						minZoom:    minZoom,
+						line:       line,
+						properties: featureProperties(class, way.Tags, true),
+					})
 				}
 				return nil
 			}
 			layer, class, minZoom, ok := areaClass(way.Tags)
-			if !ok || zoom < minZoom || len(way.NodeIDs) < 4 || way.NodeIDs[0] != way.NodeIDs[len(way.NodeIDs)-1] {
+			if !ok || len(way.NodeIDs) < 4 || way.NodeIDs[0] != way.NodeIDs[len(way.NodeIDs)-1] {
 				return nil
 			}
 			ring := wayLine(coords, way.NodeIDs)
 			if len(ring) < 4 || ring[0] != ring[len(ring)-1] {
 				return nil
 			}
-			feature := feature{kind: geometryPolygon, points: ring, properties: featureProperties(class, way.Tags, false)}
-			addFeature(builders, zoom, layer, feature)
+			features = append(features, renderableFeature{
+				layer:      layer,
+				kind:       geometryPolygon,
+				minZoom:    minZoom,
+				line:       ring,
+				properties: featureProperties(class, way.Tags, false),
+			})
 			return nil
 		})
-		if err != nil {
-			return nil, 0, err
-		}
+		return features, err
+	})
+	if err != nil {
+		return nil, err
 	}
-	return builders, roads, nil
+	var all []renderableFeature
+	for _, f := range perInput {
+		all = append(all, f...)
+	}
+	return all, nil
 }
 
-func addFeature(builders map[tileKey]*tileBuilder, zoom int, layer string, f feature) {
+// buildZoomFromFeatures is the per-zoom step: a pure in-memory filter over
+// the already-decoded feature list (no file I/O, no protobuf parsing, no
+// zlib) that keeps only features visible at zoom and buckets them into tile
+// builders.
+func buildZoomFromFeatures(features []renderableFeature, zoom int, tolerance float64) (map[tileKey]*tileBuilder, int) {
+	builders := make(map[tileKey]*tileBuilder)
+	roads := 0
+	for _, f := range features {
+		if zoom < f.minZoom {
+			continue
+		}
+		addFeature(builders, zoom, f.layer, feature{kind: f.kind, points: f.line, properties: f.properties}, tolerance)
+		if f.kind == geometryLine {
+			roads++
+		}
+	}
+	return builders, roads
+}
+
+func addFeature(builders map[tileKey]*tileBuilder, zoom int, layer string, f feature, tolerance float64) {
 	minLon, minLat, maxLon, maxLat := featureBounds(f)
 	x0, y0 := lonLatToTile(minLon, maxLat, zoom)
 	x1, y1 := lonLatToTile(maxLon, minLat, zoom)
@@ -232,7 +372,7 @@ func addFeature(builders map[tileKey]*tileBuilder, zoom int, layer string, f fea
 			key := tileKey{zoom, x, y}
 			builder := builders[key]
 			if builder == nil {
-				builder = &tileBuilder{key: key, layers: make(map[string][]feature)}
+				builder = &tileBuilder{key: key, layers: make(map[string][]feature), tolerance: tolerance}
 				builders[key] = builder
 			}
 			builder.layers[layer] = append(builder.layers[layer], f)
@@ -252,7 +392,13 @@ func featureProperties(class string, tags map[string]string, includeRef bool) ma
 	return properties
 }
 
-func writeZoom(stream *tileStreamWriter, builders map[tileKey]*tileBuilder) (int, error) {
+// writeZoom encodes and writes one zoom's tiles in deterministic sorted
+// order. Encoding — the CPU-heavy projection/simplify/clip/gzip step — runs
+// across a worker pool bounded by concurrency, but every tile is still
+// written to the stream sequentially in the same sorted order used before
+// concurrency existed here: only the computation parallelizes, never the
+// on-disk order or the resulting bytes.
+func writeZoom(stream *tileStreamWriter, builders map[tileKey]*tileBuilder, concurrency int) (int, error) {
 	keys := make([]tileKey, 0, len(builders))
 	for key := range builders {
 		keys = append(keys, key)
@@ -266,12 +412,41 @@ func writeZoom(stream *tileStreamWriter, builders map[tileKey]*tileBuilder) (int
 		}
 		return keys[i].y < keys[j].y
 	})
-	written := 0
-	for _, key := range keys {
-		data, err := builders[key].encode()
-		if err != nil {
-			return 0, err
+
+	type encodeResult struct {
+		data []byte
+		err  error
+	}
+	results := make([]encodeResult, len(keys))
+	encodeAt := func(i int) {
+		data, err := builders[keys[i]].encode()
+		results[i] = encodeResult{data, err}
+	}
+	if concurrency <= 1 || len(keys) <= 1 {
+		for i := range keys {
+			encodeAt(i)
 		}
+	} else {
+		sem := make(chan struct{}, concurrency)
+		var wg sync.WaitGroup
+		for i := range keys {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				encodeAt(i)
+			}(i)
+		}
+		wg.Wait()
+	}
+
+	written := 0
+	for i, key := range keys {
+		if results[i].err != nil {
+			return 0, results[i].err
+		}
+		data := results[i].data
 		if len(data) == 0 {
 			continue
 		}
@@ -287,7 +462,7 @@ func (b *tileBuilder) encode() ([]byte, error) {
 	if len(b.layers) == 0 {
 		return nil, nil
 	}
-	return encodeTile(b.key, b.layers)
+	return encodeTile(b.key, b.layers, b.tolerance)
 }
 
 func tileStreamMetadata(cfg Config, bounds Bounds) map[string]string {

@@ -33,9 +33,24 @@ type PBFBuildOptions struct {
 	PBFInputs    []string
 	ArtifactPath string
 
+	// Preset fills in MinZoom, MaxZoom and SimplifyTolerance when they are
+	// left at their zero value, tuning the build for a documented use case
+	// (see the Preset* constants). It never overrides a field the caller
+	// already set, and it never touches PostalCodes — see Preset's doc
+	// comment. An empty Preset behaves like PresetBalanced, i.e. today's
+	// defaults.
+	Preset Preset
+
 	MinZoom     int
 	MaxZoom     int
 	Concurrency int
+
+	// SimplifyTolerance is a Visvalingam-Whyatt effective-area threshold in
+	// squared tile pixels, applied post-projection to every layer at every
+	// zoom (see minigen.DefaultSimplifyTolerance for the full explanation of
+	// its units). Zero selects Preset's value, or the generator's default if
+	// Preset is also empty. Larger values produce smaller, coarser tiles.
+	SimplifyTolerance float64
 
 	// PostalCodes adds a "postal_code" vector layer assembled from OSM
 	// boundary=postal_code relations, and writes a GeoJSON sidecar file of

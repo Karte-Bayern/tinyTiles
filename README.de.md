@@ -461,9 +461,42 @@ den aufgelösten Wert als `batch-adjustment`.
 ### PBF-Build
 
 `tinytiles build` ist standardmäßig eigenständig. Es sammelt zunächst die
-Knoten-IDs der darstellbaren Straßen, lädt nur deren Koordinaten und verarbeitet
-die Straßen anschließend je Zoomstufe zu Vector-MBTiles. Dafür sind weder ein
-weiteres Binary, ein anderes Repository noch ein Netzdienst erforderlich.
+Knoten-IDs der darstellbaren Straßen, lädt nur deren Koordinaten, klassifiziert
+und löst dann in einem weiteren Durchlauf die Geometrie jedes darstellbaren
+Ways einmalig auf und projiziert, vereinfacht und kodiert diese im Speicher
+gehaltene Feature-Liste anschließend einmal je angeforderter Zoomstufe.
+Frühere Versionen lasen und entpackten die gesamte PBF-Datei einmal pro
+Zoomstufe erneut; die Dekodierung erfolgt jetzt höchstens dreimal insgesamt
+(Knotenreferenzen, Koordinaten, Features), unabhängig davon, wie breit
+`--minzoom`/`--maxzoom` gewählt ist. `--concurrency` parallelisiert außerdem
+die Kachel-Kodierung jeder Zoomstufe über einen Worker-Pool, statt wirkungslos
+zu bleiben. Dafür sind weder ein weiteres Binary, ein anderes Repository noch
+ein Netzdienst erforderlich.
+
+#### Presets
+
+`--preset` bündelt `--minzoom`/`--maxzoom`/`--simplify-tolerance` (und einen
+Vorschlag für `--postal-codes`) für einen der folgenden Anwendungsfälle, ohne
+die Feinsteuerung aufzugeben: Jedes zusätzlich explizit gesetzte Flag hat für
+diese eine Einstellung stets Vorrang vor dem Preset-Wert.
+
+| Preset | Zoom | Vereinfachungstoleranz | Postleitzahlen | Anwendungsfall |
+|---|---|---|---|---|
+| `balanced` (Standard) | 5–14 | 4.0 | aus | heutiges Verhalten, unverändert |
+| `fast` | 5–10 | 8.0 | aus | schnelle lokale Iteration oder CI-Smoke-Builds |
+| `detailed` | 5–16 | 2.0 | an | Webkarten (MapLibre GL JS, Mapbox GL JS, OpenLayers) mit mehr Detailtreue |
+| `mobile` | 5–12 | 6.0 | aus | Offline-first native/Browser-Clients, kleineres Artefakt |
+| `postcode` | 5–13 | 4.0 | an | Postleitzahl-Suche/Rückwärtssuche und Zufuhr für `tinytiles territory` |
+
+```bash
+./dist/tinytiles build --preset mobile region.osm.pbf region.ttiles/
+```
+
+Presets gelten nur für den eingebauten Generator; die Kombination von
+`--preset` mit `--generator` wird ebenso zurückgewiesen wie bei
+`--postal-codes`. Der gewählte Preset-Name und die aufgelöste
+Vereinfachungstoleranz werden zusammen mit `--minzoom`/`--maxzoom` in der
+Herkunftsangabe des veröffentlichten Artefakts festgehalten.
 
 Für einen reichhaltigeren lokalen Kachelsatz bleibt `--generator` ein
 expliziter Override. Das Programm muss die angeforderten MBTiles über einen
@@ -664,6 +697,21 @@ make build-server build-native-demo
 geprüfte paginierte Artefakt über `tinySQL/tiles`. Die `tinytiles`-CLI für
 Build und Import behält das Tag absichtlich, weil sie SQLite-MBTiles-Eingaben
 liest.
+
+`-preset` bündelt `-readers`, `-max-memory`, `-tile-cache-bytes` sowie das
+interne Prefetch-Tuning (das kein eigenes Flag besitzt) für eine von drei
+Einsatzgrößen und füllt dabei wieder nur die Flags, die nicht bereits
+explizit gesetzt wurden:
+
+| Preset | Reader | Max. Speicher | Kachel-Cache | Prefetch | Anwendungsfall |
+|---|---|---|---|---|---|
+| `embedded` | 1 | 16 MiB | 4 MiB | deaktiviert | kleiner Recovery-/Edge-Host, ein Artefakt, wenige Clients |
+| `balanced` (Standard) | `min(GOMAXPROCS,8)` | 64 MiB | 32 MiB | Standardwerte | heutiges Verhalten, unverändert |
+| `high-traffic` | `min(GOMAXPROCS,16)` | 128 MiB | 256 MiB | größere Queue/mehr Worker | öffentlich erreichbares Deployment, viele gleichzeitige Clients |
+
+```bash
+./dist/tinytiles-server -preset embedded -artifact region.ttiles/ -dataset region
+```
 
 Der Server hält standardmäßig einen nach Bytes begrenzten, unveränderlichen
 Kachel-Cache von 32 MiB. Ein Cache-Hit vermeidet einen Pager-Lookup, die

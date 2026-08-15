@@ -170,7 +170,7 @@ func assemblePostalMultiPolygon(rel relation, ways map[int64]*way, coords map[in
 
 // addPostalFeatures adds one MVT feature per assembled postal boundary to
 // zoom's tile builders, in the "postal_code" layer.
-func addPostalFeatures(builders map[tileKey]*tileBuilder, zoom int, features []PostalFeature) {
+func addPostalFeatures(builders map[tileKey]*tileBuilder, zoom int, features []PostalFeature, tolerance float64) {
 	for _, pf := range features {
 		rings := toMVTRings(pf.Geometry)
 		if len(rings) == 0 {
@@ -180,7 +180,7 @@ func addPostalFeatures(builders map[tileKey]*tileBuilder, zoom int, features []P
 		if pf.Name != "" {
 			properties["name"] = pf.Name
 		}
-		addFeature(builders, zoom, "postal_code", feature{kind: geometryPolygon, rings: rings, properties: properties})
+		addFeature(builders, zoom, "postal_code", feature{kind: geometryPolygon, rings: rings, properties: properties}, tolerance)
 	}
 }
 

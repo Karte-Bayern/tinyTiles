@@ -419,11 +419,40 @@ resolved value as `batch-adjustment`.
 ### PBF build
 
 `tinytiles build` is self-contained by default. It collects renderable way node
-IDs and loads only those coordinates, then streams the features once for each
-requested zoom into a vector MBTiles source before importing the immutable
-artifact. The built-in tileset contains transportation, building, water and
-landcover layers. No other project's binary, repository or network service is
-used.
+IDs and loads only those coordinates, classifies and resolves every renderable
+way's geometry in one further pass, then projects, simplifies and encodes that
+in-memory feature list once per requested zoom before importing the immutable
+artifact. Earlier versions re-scanned and re-decompressed the whole PBF file
+once per zoom level; decoding now happens at most three times total (node
+refs, coordinates, features), however wide `--minzoom`/`--maxzoom` is, and
+`--concurrency` parallelizes each zoom's tile encoding across a worker pool
+instead of being ignored. The built-in tileset contains transportation,
+building, water and landcover layers. No other project's binary, repository or
+network service is used.
+
+#### Presets
+
+`--preset` bundles `--minzoom`/`--maxzoom`/`--simplify-tolerance` (and a
+`--postal-codes` suggestion) for one of the use cases below, without giving up
+fine control: any flag you also pass explicitly always wins over the preset's
+value for that one setting.
+
+| Preset | Zoom | Simplify tolerance | Postal codes | Use case |
+|---|---|---|---|---|
+| `balanced` (default) | 5–14 | 4.0 | off | today's defaults, unchanged |
+| `fast` | 5–10 | 8.0 | off | quick local iteration or CI smoke builds |
+| `detailed` | 5–16 | 2.0 | on | web maps (MapLibre GL JS, Mapbox GL JS, OpenLayers) wanting more fidelity |
+| `mobile` | 5–12 | 6.0 | off | offline-first native/browser clients, smaller artifact |
+| `postcode` | 5–13 | 4.0 | on | postcode search/reverse-geocode serving, and feeding `tinytiles territory` |
+
+```bash
+./dist/tinytiles build --preset mobile region.osm.pbf region.ttiles/
+```
+
+Presets apply only to the built-in generator; combining `--preset` with
+`--generator` is rejected the same way `--postal-codes` is. The chosen preset
+name and the resolved simplification tolerance are recorded in the published
+artifact's provenance alongside `--minzoom`/`--maxzoom`.
 
 This compact first version renders closed OSM ways; general multipolygon
 relations intentionally remain the responsibility of an optional richer
@@ -611,6 +640,21 @@ make build-server build-native-demo
 `tinytiles-server` is built without `sqliteimport`: it opens only the
 validated paged artifact through `tinySQL/tiles`. The `tinytiles` build/import
 CLI intentionally retains the tag because it reads SQLite MBTiles input.
+
+`-preset` bundles `-readers`, `-max-memory`, `-tile-cache-bytes` and internal
+prefetch tuning (which has no individual flag) for one of three deployment
+sizes, again only filling in whichever of those flags you did not also pass
+explicitly:
+
+| Preset | Readers | Max memory | Tile cache | Prefetch | Use case |
+|---|---|---|---|---|---|
+| `embedded` | 1 | 16 MiB | 4 MiB | disabled | small recovery/edge host, one artifact, few clients |
+| `balanced` (default) | `min(GOMAXPROCS,8)` | 64 MiB | 32 MiB | defaults | today's defaults, unchanged |
+| `high-traffic` | `min(GOMAXPROCS,16)` | 128 MiB | 256 MiB | larger queue/workers | public-facing deployment, many concurrent clients |
+
+```bash
+./dist/tinytiles-server -preset embedded -artifact region.ttiles/ -dataset region
+```
 
 The server keeps a byte-bounded 32 MiB immutable tile cache by default. A
 cache hit avoids a pager lookup, payload allocation and SHA-256 recomputation.

@@ -33,6 +33,8 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	minZoom := fs.Int("minzoom", 5, "minimum tile zoom")
 	maxZoom := fs.Int("maxzoom", 14, "maximum tile zoom")
 	postalCodes := fs.Bool("postal-codes", false, "built-in generator only: add a postal_code vector layer from boundary=postal_code relations and write a <dataset-base>.postcodes.geojson sidecar")
+	preset := fs.String("preset", "", fmt.Sprintf("built-in generator only: use-case preset (%s); fills in -minzoom/-maxzoom/-simplify-tolerance/-postal-codes you did not set explicitly", presetNames()))
+	simplifyTolerance := fs.Float64("simplify-tolerance", 0, "built-in generator only: Visvalingam-Whyatt simplification tolerance in tile pixels; 0 uses the preset/generator default")
 	buildingMinZoom := fs.Int("building-minzoom", 12, "external generator only: minimum building zoom")
 	shards := fs.Int("shards", 256, "external generator only: temporary generator shard count")
 	shardCompression := fs.Bool("shard-compression", true, "external generator only: compress temporary generator shards")
@@ -55,6 +57,24 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	if fs.Parse(args) != nil || fs.NArg() != 2 {
 		fmt.Fprintln(stderr, "usage: tinytiles build [flags] source.osm.pbf[,more.osm.pbf] dataset.ttiles/")
 		return 2
+	}
+
+	presetMinZoom, presetMaxZoom, presetTolerance, presetPostalCodes, err := tinytiles.ResolvePreset(tinytiles.Preset(*preset))
+	if err != nil {
+		fmt.Fprintf(stderr, "tinytiles build: %v (choose one of: %s)\n", err, presetNames())
+		return 2
+	}
+	if !flagWasSet(fs, "minzoom") {
+		*minZoom = presetMinZoom
+	}
+	if !flagWasSet(fs, "maxzoom") {
+		*maxZoom = presetMaxZoom
+	}
+	if !flagWasSet(fs, "simplify-tolerance") {
+		*simplifyTolerance = presetTolerance
+	}
+	if !flagWasSet(fs, "postal-codes") {
+		*postalCodes = presetPostalCodes
 	}
 
 	pbfInputs, err := parsePBFInputs(fs.Arg(0))
@@ -151,17 +171,19 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 		// Progress callback below reports "phase=generate" itself.
 		fmt.Fprintln(stdout, "generator=tinytiles-minimal")
 		built, err := tinytiles.BuildPBF(ctx, tinytiles.PBFBuildOptions{
-			PBFInputs:       pbfInputs,
-			ArtifactPath:    fs.Arg(1),
-			MinZoom:         *minZoom,
-			MaxZoom:         *maxZoom,
-			Concurrency:     *concurrency,
-			PostalCodes:     *postalCodes,
-			Schema:          artifactSchema,
-			BatchSize:       *batch,
-			MaxMemoryBytes:  *memory,
-			MinFreeBytes:    *reserve,
-			ReplaceExisting: *replace,
+			PBFInputs:         pbfInputs,
+			ArtifactPath:      fs.Arg(1),
+			Preset:            tinytiles.Preset(*preset),
+			MinZoom:           *minZoom,
+			MaxZoom:           *maxZoom,
+			Concurrency:       *concurrency,
+			SimplifyTolerance: *simplifyTolerance,
+			PostalCodes:       *postalCodes,
+			Schema:            artifactSchema,
+			BatchSize:         *batch,
+			MaxMemoryBytes:    *memory,
+			MinFreeBytes:      *reserve,
+			ReplaceExisting:   *replace,
 			Progress: func(progress tinytiles.PBFBuildProgress) {
 				fmt.Fprintf(stdout, "phase=%s\n", progress.Phase)
 			},
@@ -180,6 +202,10 @@ func commandBuild(args []string, stdout, stderr io.Writer) int {
 	}
 	if *postalCodes {
 		fmt.Fprintln(stderr, "tinytiles build: --postal-codes requires the built-in generator (no --generator)")
+		return 2
+	}
+	if strings.TrimSpace(*preset) != "" {
+		fmt.Fprintln(stderr, "tinytiles build: --preset requires the built-in generator (no --generator)")
 		return 2
 	}
 
@@ -639,6 +665,17 @@ func quoteArguments(args []string) string {
 		quoted[i] = strconv.Quote(arg)
 	}
 	return strings.Join(quoted, " ")
+}
+
+// presetNames lists every defined build preset, comma-separated, for flag
+// usage text and error messages.
+func presetNames() string {
+	presets := tinytiles.Presets()
+	names := make([]string, len(presets))
+	for i, p := range presets {
+		names[i] = string(p)
+	}
+	return strings.Join(names, ", ")
 }
 
 func flagWasSet(fs *flag.FlagSet, name string) bool {

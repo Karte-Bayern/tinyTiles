@@ -2,7 +2,7 @@ module github.com/Karte-Bayern/tinyTiles/v2
 
 go 1.26.5
 
-require github.com/SimonWaldherr/tinySQL v0.32.2
+require github.com/SimonWaldherr/tinySQL v0.33.0
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

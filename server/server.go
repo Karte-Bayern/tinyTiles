@@ -400,7 +400,11 @@ func (s *Server) routePrefetcher() *tilePrefetcher {
 //   - /tilejson.json and /metadata expose standard consumer metadata;
 //   - /sync/manifest.json and /sync/tiles/{revision}/{z}/{x}/{y} provide the
 //     revisioned TMS cache protocol for native and WASM clients;
-//   - /healthz returns 204 when this Server is configured.
+//   - /healthz returns 204 when this Server is configured;
+//   - /readyz returns 200 once a Dataset generation is loaded and swappable,
+//     503 otherwise, for use as a load balancer readiness probe;
+//   - /stats returns a JSON snapshot of the current generation and tile
+//     cache occupancy/hit-rate for diagnostics.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/tiles/", http.StripPrefix("/tiles/", s.XYZHandler()))
@@ -412,7 +416,78 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("/postcode/", s.servePostcode)
 	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	mux.HandleFunc("/readyz", s.serveReadyz)
+	mux.HandleFunc("/stats", s.serveStats)
 	return s.withCORS(mux)
+}
+
+// serveReadyz reports whether a Dataset generation is currently loaded and
+// serving. Unlike /healthz, which only confirms the process is up, this is
+// meant for a load balancer to gate traffic during Server construction or a
+// SwapDataset transition.
+func (s *Server) serveReadyz(w http.ResponseWriter, _ *http.Request) {
+	if s.gen.Load() == nil {
+		http.Error(w, "no dataset generation loaded", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// statsPayload is the JSON shape returned by /stats. It intentionally exposes
+// only cheap, already-computed facts plus the tile cache's atomic counters;
+// it never triggers additional dataset or artifact reads.
+type statsPayload struct {
+	DatasetID string          `json:"dataset_id"`
+	Revision  string          `json:"revision"`
+	CreatedAt time.Time       `json:"created_at"`
+	Source    string          `json:"source,omitempty"`
+	TileCache *statsTileCache `json:"tile_cache,omitempty"`
+}
+
+type statsTileCache struct {
+	Hits      int64   `json:"hits"`
+	Misses    int64   `json:"misses"`
+	Puts      int64   `json:"puts"`
+	HitRatio  float64 `json:"hit_ratio"`
+	UsedBytes int64   `json:"used_bytes"`
+	MaxBytes  int64   `json:"max_bytes"`
+}
+
+func (s *Server) serveStats(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet && request.Method != http.MethodHead {
+		methodNotAllowed(w, http.MethodGet, http.MethodHead)
+		return
+	}
+	gen := s.gen.Load()
+	payload := statsPayload{
+		DatasetID: s.datasetID,
+		Revision:  gen.revision,
+		CreatedAt: gen.createdAt,
+		Source:    gen.dataset.Info().Source,
+	}
+	if gen.tileCache != nil {
+		cacheStats := gen.tileCache.Stats()
+		ratio := 0.0
+		if total := cacheStats.Hits + cacheStats.Misses; total > 0 {
+			ratio = float64(cacheStats.Hits) / float64(total)
+		}
+		payload.TileCache = &statsTileCache{
+			Hits:      cacheStats.Hits,
+			Misses:    cacheStats.Misses,
+			Puts:      cacheStats.Puts,
+			HitRatio:  ratio,
+			UsedBytes: cacheStats.UsedBytes,
+			MaxBytes:  cacheStats.MaxBytes,
+		}
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		http.Error(w, "encode stats", http.StatusInternalServerError)
+		return
+	}
+	setHeader(w.Header(), "Content-Type", "application/json; charset=utf-8")
+	setHeader(w.Header(), "Cache-Control", "no-store")
+	_, _ = w.Write(body)
 }
 
 // XYZHandler serves bare z/x/y[.<format>] paths. This makes it safe to mount in an

@@ -28,6 +28,40 @@ const (
 type tileCache struct {
 	shards    [tileCacheShardCount]tileCacheShard
 	largeTile tileCacheShard
+	hits      atomic.Int64
+	misses    atomic.Int64
+	puts      atomic.Int64
+}
+
+// tileCacheStats is a point-in-time snapshot of tileCache activity and
+// occupancy, exposed for diagnostics (see Server's /stats endpoint).
+type tileCacheStats struct {
+	Hits      int64
+	Misses    int64
+	Puts      int64
+	UsedBytes int64
+	MaxBytes  int64
+}
+
+// Stats returns a snapshot of this cache's hit/miss counters and current
+// byte occupancy. It is safe to call concurrently with get/put.
+func (c *tileCache) Stats() tileCacheStats {
+	if c == nil {
+		return tileCacheStats{}
+	}
+	stats := tileCacheStats{Hits: c.hits.Load(), Misses: c.misses.Load(), Puts: c.puts.Load()}
+	for i := range c.shards {
+		shard := &c.shards[i]
+		shard.mu.Lock()
+		stats.UsedBytes += shard.used
+		stats.MaxBytes += shard.maxBytes
+		shard.mu.Unlock()
+	}
+	c.largeTile.mu.Lock()
+	stats.UsedBytes += c.largeTile.used
+	stats.MaxBytes += c.largeTile.maxBytes
+	c.largeTile.mu.Unlock()
+	return stats
 }
 
 type tileCacheShard struct {
@@ -90,24 +124,33 @@ func (c *tileCache) get(key tiles.Key) ([]byte, string, bool) {
 	}
 	normal := c.shard(key)
 	if data, checksum, found := c.getFast(normal, key); found {
+		c.hits.Add(1)
 		return data, checksum, true
 	}
 	// Large payloads live in their shared lane. Probe its lock-free front
 	// before taking the normal lane's mutex on a miss so a popular aerial tile
 	// stays cheap too.
 	if data, checksum, found := c.getFast(&c.largeTile, key); found {
+		c.hits.Add(1)
 		return data, checksum, true
 	}
 	if data, checksum, found := c.getFrom(normal, key); found {
+		c.hits.Add(1)
 		return data, checksum, true
 	}
-	return c.getFrom(&c.largeTile, key)
+	if data, checksum, found := c.getFrom(&c.largeTile, key); found {
+		c.hits.Add(1)
+		return data, checksum, true
+	}
+	c.misses.Add(1)
+	return nil, "", false
 }
 
 func (c *tileCache) put(key tiles.Key, data []byte, checksum string) {
 	if c == nil {
 		return
 	}
+	c.puts.Add(1)
 	size := tileCacheChecksumSize(checksum) + int64(len(data))
 	shard := c.shard(key)
 	if size > shard.maxBytes {

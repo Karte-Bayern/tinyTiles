@@ -253,6 +253,47 @@ func TestHandlerServesMapLibreStyle(t *testing.T) {
 	}
 }
 
+func TestHandlerServesReadyzAndStats(t *testing.T) {
+	server := testServer(t)
+
+	readyRequest := httptest.NewRequest(http.MethodGet, "https://tiles.example/readyz", nil)
+	readyResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(readyResponse, readyRequest)
+	if readyResponse.Code != http.StatusOK {
+		t.Fatalf("readyz status = %d", readyResponse.Code)
+	}
+
+	// First request is a cache miss that populates the cache; the second is a
+	// guaranteed hit, so the assertion below does not race the cache fill.
+	for range 2 {
+		xyzRequest := httptest.NewRequest(http.MethodGet, "https://tiles.example/tiles/2/1/1.mvt", nil)
+		server.Handler().ServeHTTP(httptest.NewRecorder(), xyzRequest)
+	}
+
+	statsRequest := httptest.NewRequest(http.MethodGet, "https://tiles.example/stats", nil)
+	statsResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(statsResponse, statsRequest)
+	if statsResponse.Code != http.StatusOK {
+		t.Fatalf("stats status = %d: %s", statsResponse.Code, statsResponse.Body.String())
+	}
+	var stats statsPayload
+	if err := json.Unmarshal(statsResponse.Body.Bytes(), &stats); err != nil {
+		t.Fatal(err)
+	}
+	if stats.DatasetID != "fixture" {
+		t.Fatalf("stats dataset_id = %q, want fixture", stats.DatasetID)
+	}
+	if stats.Revision == "" {
+		t.Fatal("stats revision is empty")
+	}
+	if stats.TileCache == nil {
+		t.Fatal("stats tile_cache is nil")
+	}
+	if stats.TileCache.Hits < 1 {
+		t.Fatalf("stats tile_cache hits = %d, want >= 1", stats.TileCache.Hits)
+	}
+}
+
 func TestMountedHandlerAdvertisesMountPath(t *testing.T) {
 	server, err := New(Config{Dataset: testDataset(t), DatasetID: "fixture", MountPath: "/tinytiles"})
 	if err != nil {

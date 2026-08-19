@@ -135,6 +135,8 @@ func landcoverStyleLayer() map[string]any {
 				"forest", "#c9e1b9",
 				"farmland", "#eee4c5",
 				"meadow", "#ddebc8",
+				"grass", "#d7e8bd",
+				"urban", "#e0dcd3",
 				"#e7e5df",
 			},
 			"fill-opacity": 0.8,

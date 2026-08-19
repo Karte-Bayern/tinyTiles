@@ -428,7 +428,10 @@ refs, coordinates, features), however wide `--minzoom`/`--maxzoom` is, and
 `--concurrency` parallelizes each zoom's tile encoding across a worker pool
 instead of being ignored. The built-in tileset contains transportation,
 building, water and landcover layers. No other project's binary, repository or
-network service is used.
+network service is used. The `landcover` layer's `class` field distinguishes
+`forest`, `farmland`, `meadow`, `grass` (`natural=grassland/scrub/heath` and
+`landuse=grass`) and `urban` (`landuse=residential/commercial/industrial/
+retail`), each with its own `/style.json` fill color.
 
 #### Presets
 
@@ -698,7 +701,13 @@ style at `/style.json` (paint rules generated for whichever `vector_layers`
 the dataset actually declares — water/landcover/building/transportation/
 postal_code — or a raster style for a raster tileset), metadata at
 `/metadata`, and the browser-safe revisioned TMS sync protocol at
-`/sync/manifest.json`. Passing `-postcodes region.postcodes.geojson` (the
+`/sync/manifest.json`. `/healthz` is a static liveness probe; `/readyz`
+additionally reports whether a Dataset generation is currently loaded
+(200) or the Server has none yet (503), for use as a load-balancer
+readiness check across a `SwapDataset` transition. `/stats` returns a small
+JSON diagnostics snapshot — dataset ID, revision, source, and tile cache
+hit/miss/put counters with the resulting hit ratio and byte occupancy.
+Passing `-postcodes region.postcodes.geojson` (the
 sidecar `tinytiles build --postal-codes` writes) additionally enables
 `GET /postcode/{code}` (full boundary lookup), `GET /postcode/search?q=`
 (prefix/substring search) and `GET /postcode/at?lon=&lat=` (reverse lookup —

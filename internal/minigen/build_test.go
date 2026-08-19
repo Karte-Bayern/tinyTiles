@@ -36,6 +36,14 @@ func TestAreaClass(t *testing.T) {
 		{map[string]string{"natural": "wood"}, "landcover", "forest", 9, true},
 		{map[string]string{"landuse": "farmland"}, "landcover", "farmland", 10, true},
 		{map[string]string{"landuse": "meadow"}, "landcover", "meadow", 10, true},
+		{map[string]string{"natural": "grassland"}, "landcover", "grass", 10, true},
+		{map[string]string{"natural": "scrub"}, "landcover", "grass", 10, true},
+		{map[string]string{"natural": "heath"}, "landcover", "grass", 10, true},
+		{map[string]string{"landuse": "grass"}, "landcover", "grass", 10, true},
+		{map[string]string{"landuse": "residential"}, "landcover", "urban", 10, true},
+		{map[string]string{"landuse": "commercial"}, "landcover", "urban", 10, true},
+		{map[string]string{"landuse": "industrial"}, "landcover", "urban", 10, true},
+		{map[string]string{"landuse": "retail"}, "landcover", "urban", 10, true},
 		{map[string]string{"building": "no"}, "", "", 0, false},
 	}
 	for _, test := range tests {

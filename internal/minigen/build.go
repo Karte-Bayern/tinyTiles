@@ -504,6 +504,8 @@ func areaClass(tags map[string]string) (layer, class string, minZoom int, ok boo
 		return "water", "water", 8, true
 	case "wood":
 		return "landcover", "forest", 9, true
+	case "grassland", "scrub", "heath":
+		return "landcover", "grass", 10, true
 	}
 	switch tags["waterway"] {
 	case "riverbank":
@@ -518,6 +520,10 @@ func areaClass(tags map[string]string) (layer, class string, minZoom int, ok boo
 		return "landcover", "farmland", 10, true
 	case "meadow":
 		return "landcover", "meadow", 10, true
+	case "grass":
+		return "landcover", "grass", 10, true
+	case "residential", "commercial", "industrial", "retail":
+		return "landcover", "urban", 10, true
 	}
 	return "", "", 0, false
 }

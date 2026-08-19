@@ -119,7 +119,9 @@ Eine Offline-Straßenkarte lässt sich direkt aus PBF bauen:
 
 Der eingebaute Erzeuger schreibt die MVT-Schichten `transportation` (große
 Straßen, Straßen und Wege), `building`, `water` und `landcover` (Wald, Felder,
-Wiesen und Obst-/Weinanbau). Er enthält absichtlich keine Luftbilder, POIs oder
+Wiesen und Obst-/Weinanbau, außerdem Grünland/Gestrüpp/Heide als `grass` und
+Wohn-/Gewerbe-/Industrie-/Einzelhandelsflächen als `urban`). Er enthält
+absichtlich keine Luftbilder, POIs oder
 Beschriftungen; ein lokaler MapLibre-Stil rendert die Schichten. Für sehr große
 Extrakte oder einen reichhaltigeren Kachelsatz kann `--generator` weiterhin
 explizit auf ein kompatibles lokales Programm verweisen.
@@ -762,7 +764,13 @@ TileJSON unter `/tilejson.json`, einen MapLibre-GL-Style unter `/style.json`
 deklariert — water/landcover/building/transportation/postal_code — oder ein
 Raster-Style für ein Raster-Tileset), Metadaten unter `/metadata` und das
 browser-sichere, versionsbezogene TMS-Synchronisierungsprotokoll unter
-`/sync/manifest.json` bereit. Mit `-postcodes region.postcodes.geojson` (dem
+`/sync/manifest.json` bereit. `/healthz` ist eine statische Liveness-Prüfung;
+`/readyz` meldet zusätzlich, ob gerade eine Dataset-Generation geladen ist
+(200) oder der Server noch keine hat (503) — nützlich als Readiness-Check
+eines Load Balancers über eine `SwapDataset`-Umschaltung hinweg. `/stats`
+liefert einen kleinen JSON-Diagnose-Schnappschuss — Dataset-ID, Revision,
+Quelle sowie Trefferzähler des Tile-Caches (Hits/Misses/Puts) samt
+Trefferquote und Byte-Auslastung. Mit `-postcodes region.postcodes.geojson` (dem
 Sidecar, den `tinytiles build --postal-codes` schreibt) kommen zusätzlich
 `GET /postcode/{code}` (vollständige Grenz-Abfrage), `GET
 /postcode/search?q=` (Präfix-/Teilstring-Suche) und `GET

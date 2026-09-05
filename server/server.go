@@ -969,7 +969,7 @@ func acceptsGzip(request *http.Request) bool {
 	// "Accept-Encoding: identity" is the standard way a client asks for an
 	// uncompressed body, and gzip must not be forced on it.
 	sawWildcard, wildcardAllowed := false, false
-	for _, part := range strings.Split(header, ",") {
+	for part := range strings.SplitSeq(header, ",") {
 		token, quality := parseAcceptEncodingToken(part)
 		switch token {
 		case "gzip":
@@ -991,9 +991,9 @@ func acceptsGzip(request *http.Request) bool {
 // the coding name's presence.
 func parseAcceptEncodingToken(part string) (token string, quality float64) {
 	quality = 1
-	fields := strings.Split(part, ";")
-	token = strings.ToLower(strings.TrimSpace(fields[0]))
-	for _, param := range fields[1:] {
+	name, params, _ := strings.Cut(part, ";")
+	token = strings.ToLower(strings.TrimSpace(name))
+	for param := range strings.SplitSeq(params, ";") {
 		value, found := strings.CutPrefix(strings.TrimSpace(param), "q=")
 		if !found {
 			continue

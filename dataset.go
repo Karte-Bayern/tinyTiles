@@ -186,9 +186,6 @@ func (d *Dataset) MetadataValue(ctx context.Context, name string) (string, bool,
 
 // LookupTMS performs one exact MBTiles/TMS tile lookup.
 func (d *Dataset) LookupTMS(ctx context.Context, key tiles.Key) (tiles.Tile, bool, error) {
-	if err := key.Validate(); err != nil {
-		return tiles.Tile{}, false, err
-	}
 	var tile tiles.Tile
 	found, err := d.LookupTMSFunc(ctx, key, func(result tiles.Tile) error {
 		tile = result
@@ -203,6 +200,10 @@ func (d *Dataset) LookupTMSFunc(ctx context.Context, key tiles.Key, fn func(tile
 	if err := key.Validate(); err != nil {
 		return false, err
 	}
+	return d.lookupValidated(ctx, key, fn)
+}
+
+func (d *Dataset) lookupValidated(ctx context.Context, key tiles.Key, fn func(tiles.Tile) error) (bool, error) {
 	if fn == nil {
 		return false, fmt.Errorf("tinytiles: callback is required")
 	}
@@ -222,7 +223,12 @@ func (d *Dataset) LookupXYZ(ctx context.Context, z, x, yXYZ int) (tiles.Tile, bo
 		return tiles.Tile{}, false, err
 	}
 	key.Y = (1 << z) - 1 - yXYZ
-	return d.LookupTMS(ctx, key)
+	var tile tiles.Tile
+	found, err := d.lookupValidated(ctx, key, func(result tiles.Tile) error {
+		tile = result
+		return nil
+	})
+	return tile, found, err
 }
 
 // LookupXYZFunc performs one slippy-map XYZ tile lookup and passes the caller-owned
@@ -233,10 +239,7 @@ func (d *Dataset) LookupXYZFunc(ctx context.Context, z, x, yXYZ int, fn func(til
 		return false, err
 	}
 	key.Y = (1 << z) - 1 - yXYZ
-	if fn == nil {
-		return false, fmt.Errorf("tinytiles: callback is required")
-	}
-	return d.LookupTMSFunc(ctx, key, fn)
+	return d.lookupValidated(ctx, key, fn)
 }
 
 // GetTileXYZ is a migration-friendly adapter for servers with the established
@@ -259,6 +262,9 @@ func (d *Dataset) GetTileXYZ(z, x, yXYZ int) ([]byte, error) {
 func (d *Dataset) ScanTMS(ctx context.Context, tileRange tiles.Range, fn func(tiles.Tile) error) error {
 	if err := tileRange.Validate(); err != nil {
 		return err
+	}
+	if fn == nil {
+		return fmt.Errorf("tinytiles: callback is required")
 	}
 	reader, err := d.acquire(ctx)
 	if err != nil {

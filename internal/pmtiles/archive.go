@@ -474,6 +474,9 @@ func (a *Archive) readDirectory(offset, length, limit uint64, name string) ([]en
 //
 // The callback must not retain Tile.Data beyond its own return.
 func (a *Archive) EachTile(ctx context.Context, visit func(Tile) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if visit == nil {
 		return errors.New("pmtiles: tile visitor is nil")
 	}
@@ -486,7 +489,8 @@ func (a *Archive) EachTile(ctx context.Context, visit func(Tile) error) error {
 		budget = maxAddressedTiles
 	}
 	remaining := budget
-	if err := a.walk(ctx, root, 0, &remaining, visit); err != nil {
+	var buffer []byte
+	if err := a.walk(ctx, root, 0, &remaining, &buffer, visit); err != nil {
 		return err
 	}
 	if a.header.AddressedTiles != 0 && remaining != 0 {
@@ -498,6 +502,9 @@ func (a *Archive) EachTile(ctx context.Context, visit func(Tile) error) error {
 // InspectTiles walks only PMTiles directories and computes exact bounds for a
 // subsequent direct artifact import. Tile payload sections are not read.
 func (a *Archive) InspectTiles(ctx context.Context) (TileStats, error) {
+	if err := ctx.Err(); err != nil {
+		return TileStats{}, err
+	}
 	root, err := a.readDirectory(a.header.RootDirectoryOffset, a.header.RootDirectoryLength, maxRootDirectoryBytes, "root directory")
 	if err != nil {
 		return TileStats{}, err
@@ -520,6 +527,9 @@ func (a *Archive) InspectTiles(ctx context.Context) (TileStats, error) {
 func (a *Archive) inspectTiles(ctx context.Context, entries []entry, depth int, remaining *uint64, stats *TileStats) error {
 	for _, current := range entries {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := a.validateEntry(current); err != nil {
 			return err
 		}
 		if current.runLength == 0 {
@@ -565,9 +575,12 @@ func (a *Archive) inspectTiles(ctx context.Context, entries []entry, depth int, 
 	return nil
 }
 
-func (a *Archive) walk(ctx context.Context, entries []entry, depth int, remaining *uint64, visit func(Tile) error) error {
+func (a *Archive) walk(ctx context.Context, entries []entry, depth int, remaining *uint64, buffer *[]byte, visit func(Tile) error) error {
 	for _, current := range entries {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := a.validateEntry(current); err != nil {
 			return err
 		}
 		if current.runLength == 0 {
@@ -585,7 +598,7 @@ func (a *Archive) walk(ctx context.Context, entries []entry, depth int, remainin
 			if err != nil {
 				return err
 			}
-			if err := a.walk(ctx, leaf, depth+1, remaining, visit); err != nil {
+			if err := a.walk(ctx, leaf, depth+1, remaining, buffer, visit); err != nil {
 				return err
 			}
 			continue
@@ -600,12 +613,19 @@ func (a *Archive) walk(ctx context.Context, entries []entry, depth int, remainin
 		if err != nil {
 			return err
 		}
-		// One stored blob backs the whole run, so read it once.
-		data, err := a.readSection(offset, current.length, maxTileBytes, "tile data")
-		if err != nil {
-			return err
+		// The visitor only borrows Data, so reuse one bounded buffer across
+		// entries and leaf directories instead of allocating per stored blob.
+		if uint64(cap(*buffer)) < current.length {
+			*buffer = make([]byte, current.length)
+		}
+		data := (*buffer)[:current.length]
+		if _, err := a.file.ReadAt(data, int64(offset)); err != nil {
+			return fmt.Errorf("pmtiles: read tile data: %w", err)
 		}
 		for step := uint64(0); step < current.runLength; step++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if current.tileID > ^uint64(0)-step {
 				return errors.New("pmtiles: run length overflows the tile id space")
 			}
@@ -618,6 +638,24 @@ func (a *Archive) walk(ctx context.Context, entries []entry, depth int, remainin
 			}
 		}
 		*remaining -= current.runLength
+	}
+	return nil
+}
+
+// Validate section-relative extents during preflight as well as import.
+// File bounds alone would allow an entry to point into a different section.
+func (a *Archive) validateEntry(e entry) error {
+	if e.runLength == 0 {
+		if e.offset > a.header.LeafDirectoryLength || e.length > a.header.LeafDirectoryLength-e.offset {
+			return errors.New("pmtiles: leaf entry extends past the leaf directory section")
+		}
+		return nil
+	}
+	if e.offset > a.header.TileDataLength || e.length > a.header.TileDataLength-e.offset {
+		return errors.New("pmtiles: tile entry extends past the tile data section")
+	}
+	if e.tileID > maxTileID || e.runLength-1 > maxTileID-e.tileID {
+		return errors.New("pmtiles: run length exceeds the supported tile id space")
 	}
 	return nil
 }

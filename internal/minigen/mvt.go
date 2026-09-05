@@ -3,8 +3,10 @@ package minigen
 import (
 	"bytes"
 	"compress/gzip"
+	"io"
 	"math"
 	"sort"
+	"sync"
 
 	"github.com/Karte-Bayern/tinyTiles/v2/internal/minigen/simplify"
 )
@@ -40,6 +42,10 @@ type ring struct {
 	hole   bool
 }
 
+// Reuse the compressor's working memory across tiles. Output buffers remain
+// caller-owned; resetting to io.Discard prevents the pool retaining payloads.
+var tileGzipWriters = sync.Pool{New: func() any { return gzip.NewWriter(io.Discard) }}
+
 func encodeTile(key tileKey, layers map[string][]feature, tolerance float64) ([]byte, error) {
 	var tile []byte
 	for _, name := range []string{"water", "landcover", "building", "transportation", "postal_code"} {
@@ -51,7 +57,12 @@ func encodeTile(key tileKey, layers map[string][]feature, tolerance float64) ([]
 		return nil, nil
 	}
 	var out bytes.Buffer
-	zw := gzip.NewWriter(&out)
+	zw := tileGzipWriters.Get().(*gzip.Writer)
+	zw.Reset(&out)
+	defer func() {
+		zw.Reset(io.Discard)
+		tileGzipWriters.Put(zw)
+	}()
 	if _, err := zw.Write(tile); err != nil {
 		return nil, err
 	}

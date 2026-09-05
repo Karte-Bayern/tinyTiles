@@ -277,3 +277,16 @@ func waitForDatasetClose(t *testing.T, dataset *Dataset) {
 		runtime.Gosched()
 	}
 }
+
+func TestDatasetRejectsNilCallbacksBeforeBorrow(t *testing.T) {
+	d := &Dataset{done: make(chan struct{})}
+	if _, err := d.LookupTMSFunc(context.Background(), tiles.Key{}, nil); err == nil {
+		t.Fatal("nil TMS callback accepted")
+	}
+	if _, err := d.LookupXYZFunc(context.Background(), 0, 0, 0, nil); err == nil {
+		t.Fatal("nil XYZ callback accepted")
+	}
+	if err := d.ScanTMS(context.Background(), tiles.Range{}, nil); err == nil {
+		t.Fatal("nil scan callback accepted")
+	}
+}

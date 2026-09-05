@@ -70,7 +70,7 @@ Commands:
   import     build and atomically publish a bounded read artifact
   validate   run the complete checksum, table, index and tile-digest audit
   inspect    print the published semantic artifact information as JSON
-  tile       read one TMS tile; use -out to write binary data to a file
+  tile       read one tile (default TMS, -scheme xyz); -out writes to a file
   benchmark  compare warm TMS point-lookups with SQLite
   territory  group, dissolve and export polygons into custom territories
 

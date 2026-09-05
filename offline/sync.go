@@ -57,9 +57,10 @@ type SyncResult struct {
 // for that revision is present. If a fetch fails, a previous manifest remains
 // usable and the next run can safely resume from retained revisioned tiles.
 type Synchronizer struct {
-	Store   Store
-	Fetcher Fetcher
-	mu      sync.Mutex
+	Store    Store
+	Fetcher  Fetcher
+	initGate sync.Once
+	gate     chan struct{}
 }
 
 func (s *Synchronizer) Sync(ctx context.Context, request SyncRequest) (SyncResult, error) {
@@ -68,8 +69,19 @@ func (s *Synchronizer) Sync(ctx context.Context, request SyncRequest) (SyncResul
 	}
 	// One synchronizer serializes manifest publication. A caller that shares a
 	// Store across components should likewise share this synchronizer instance.
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return SyncResult{}, err
+	}
+	s.initGate.Do(func() { s.gate = make(chan struct{}, 1) })
+	select {
+	case s.gate <- struct{}{}:
+		defer func() { <-s.gate }()
+	case <-ctx.Done():
+		return SyncResult{}, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return SyncResult{}, err
+	}
 	if s.Store == nil {
 		return SyncResult{}, errors.New("offline sync store is nil")
 	}
@@ -128,7 +140,7 @@ func (s *Synchronizer) Sync(ctx context.Context, request SyncRequest) (SyncResul
 		}
 	}
 
-	workers := request.workerCount()
+	workers := int(min(uint64(request.workerCount()), total))
 	jobs := make(chan TileKey, workers*2)
 	workCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

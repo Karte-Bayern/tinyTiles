@@ -2,6 +2,7 @@ package territory
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/Karte-Bayern/tinyTiles/v2/internal/geo"
 )
@@ -73,23 +74,33 @@ func Validate(opts Options) (Report, error) {
 // they are correctly never flagged.
 func detectOverlaps(opts Options) []string {
 	features := opts.Features
-	bboxes := make([][4]float64, len(features))
-	ok := make([]bool, len(features))
-	for i, f := range features {
-		bboxes[i], ok[i] = geo.BBox(f.Geometry)
+	type candidate struct {
+		index int
+		bbox  [4]float64
 	}
-	var warnings []string
-	for i := 0; i < len(features); i++ {
-		if !ok[i] {
-			continue
+	candidates := make([]candidate, 0, len(features))
+	for i, f := range features {
+		if bbox, ok := geo.BBox(f.Geometry); ok {
+			candidates = append(candidates, candidate{i, bbox})
 		}
-		for j := i + 1; j < len(features); j++ {
-			if !ok[j] || !bboxAreaOverlap(bboxes[i], bboxes[j]) {
+	}
+	// Sorted minimum longitudes let disjoint candidates stop the inner scan.
+	// Dense overlapping inputs still require reporting every matching pair.
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].bbox[0] < candidates[j].bbox[0] })
+	var warnings []string
+	for i, a := range candidates {
+		for _, b := range candidates[i+1:] {
+			if b.bbox[0] >= a.bbox[2] {
+				break
+			}
+			if !bboxAreaOverlap(a.bbox, b.bbox) {
 				continue
 			}
-			a := stringify(features[i].Properties[opts.GeometryKey])
-			b := stringify(features[j].Properties[opts.GeometryKey])
-			warnings = append(warnings, fmt.Sprintf("%s and %s", a, b))
+			// Preserve the original feature order in diagnostic messages.
+			first, second := min(a.index, b.index), max(a.index, b.index)
+			left := stringify(features[first].Properties[opts.GeometryKey])
+			right := stringify(features[second].Properties[opts.GeometryKey])
+			warnings = append(warnings, fmt.Sprintf("%s and %s", left, right))
 		}
 	}
 	return SortedUnique(warnings)

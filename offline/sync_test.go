@@ -287,3 +287,45 @@ func (f *fakeFetcher) maxConcurrent() int {
 	defer f.mu.Unlock()
 	return f.max
 }
+
+func TestSynchronizerWaitingCallCanBeCanceled(t *testing.T) {
+	s := &Synchronizer{Store: NewMemoryStore(), Fetcher: &fakeFetcher{manifest: testManifest("queued")}}
+	entered, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Sync(context.Background(), SyncRequest{Progress: func(p SyncProgress) {
+			if p.Phase == "manifest" {
+				close(entered)
+				<-release
+			}
+		}})
+		done <- err
+	}()
+	<-entered
+	defer func() {
+		close(release)
+		if err := <-done; err != nil {
+			t.Errorf("first sync: %v", err)
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	second := make(chan error, 1)
+	go func() { _, err := s.Sync(ctx, SyncRequest{}); second <- err }()
+	cancel()
+	select {
+	case err := <-second:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("waiting sync: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled sync waited for the active sync")
+	}
+}
+
+func TestSynchronizerEmptyRequestPublishes(t *testing.T) {
+	s := &Synchronizer{Store: NewMemoryStore(), Fetcher: &fakeFetcher{manifest: testManifest("empty")}}
+	result, err := s.Sync(context.Background(), SyncRequest{})
+	if err != nil || result.Total != 0 || !result.ManifestWasNew {
+		t.Fatalf("empty sync: %+v %v", result, err)
+	}
+}

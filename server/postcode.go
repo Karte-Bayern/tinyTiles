@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -11,20 +12,21 @@ import (
 	"github.com/Karte-Bayern/tinyTiles/v2/internal/geo"
 )
 
-// postcodeSearchLimit bounds a single /postcode/search response — this is a
-// lightweight lookup index, not a paginated search API.
+// postcodeSearchLimit bounds a single /postcode/search response.
 const postcodeSearchLimit = 50
 
 // postcodeRecord is one postal-code boundary loaded from the GeoJSON sidecar
 // a PostalCodes-enabled build writes (see BuildPBF/`tinytiles build
 // --postal-codes` and internal/minigen's postal_code layer).
 type postcodeRecord struct {
-	Code     string
-	Name     string
-	Geometry geo.MultiPolygon
-	Center   [2]float64
-	BBox     [4]float64
-	HasBBox  bool
+	Code        string
+	Name        string
+	Geometry    geo.MultiPolygon
+	Center      [2]float64
+	BBox        [4]float64
+	HasBBox     bool
+	searchCode  string
+	searchNames []string
 }
 
 // postcodeIndex is immutable once loaded and read concurrently without
@@ -49,12 +51,27 @@ func loadPostcodeIndex(path string) (*postcodeIndex, error) {
 		if code == "" {
 			continue
 		}
-		rec := postcodeRecord{Code: code, Name: propertyString(f.Properties, "name"), Geometry: f.Geometry}
-		if bbox, ok := geo.BBox(f.Geometry); ok {
+		key := normalizePostcode(code)
+		rec, exists := idx.byCode[key]
+		if !exists {
+			rec = postcodeRecord{Code: code, searchCode: key}
+		}
+		name := propertyString(f.Properties, "name")
+		if rec.Name == "" {
+			rec.Name = name
+		}
+		if name != "" {
+			rec.searchNames = append(rec.searchNames, strings.ToLower(name))
+		}
+		rec.Geometry = append(rec.Geometry, f.Geometry...)
+		idx.byCode[key] = rec
+	}
+	for key, rec := range idx.byCode {
+		if bbox, ok := geo.BBox(rec.Geometry); ok {
 			rec.BBox, rec.HasBBox = bbox, true
 			rec.Center = [2]float64{(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2}
 		}
-		idx.byCode[normalizePostcode(code)] = rec
+		idx.byCode[key] = rec
 		idx.all = append(idx.all, rec)
 	}
 	sort.Slice(idx.all, func(i, j int) bool { return idx.all[i].Code < idx.all[j].Code })
@@ -114,18 +131,53 @@ func (s *Server) servePostcodeLookup(w http.ResponseWriter, r *http.Request, cod
 // works. Geometry is omitted; a search result only needs enough to let a
 // client pick one, then look it up.
 func (s *Server) servePostcodeSearch(w http.ResponseWriter, r *http.Request) {
-	query := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
-	results := make([]map[string]any, 0, postcodeSearchLimit)
+	params := r.URL.Query()
+	limit, offset := postcodeSearchLimit, 0
+	for _, param := range []struct {
+		name  string
+		value *int
+	}{{"limit", &limit}, {"offset", &offset}} {
+		if values, ok := params[param.name]; ok {
+			if len(values) != 1 {
+				http.Error(w, "invalid search pagination", http.StatusBadRequest)
+				return
+			}
+			n, err := strconv.Atoi(values[0])
+			if err != nil || n < 0 || (param.name == "limit" && (n < 1 || n > postcodeSearchLimit)) {
+				http.Error(w, "limit must be 1..50 and offset must be non-negative", http.StatusBadRequest)
+				return
+			}
+			*param.value = n
+		}
+	}
+	query := strings.ToLower(strings.TrimSpace(params.Get("q")))
+	results := make([]map[string]any, 0, limit)
 	for _, rec := range s.postcodeIndex.all {
-		if query != "" && !strings.Contains(strings.ToLower(rec.Code), query) && !strings.Contains(strings.ToLower(rec.Name), query) {
+		if !rec.matches(query) {
+			continue
+		}
+		if offset > 0 {
+			offset--
 			continue
 		}
 		results = append(results, postcodeSummary(rec, false))
-		if len(results) >= postcodeSearchLimit {
+		if len(results) >= limit {
 			break
 		}
 	}
 	writePostcodeResults(w, r, results)
+}
+
+func (rec postcodeRecord) matches(query string) bool {
+	if query == "" || strings.Contains(rec.searchCode, query) {
+		return true
+	}
+	for _, name := range rec.searchNames {
+		if strings.Contains(name, query) {
+			return true
+		}
+	}
+	return false
 }
 
 // servePostcodeAt answers "which postcode contains this point" — reverse
@@ -138,6 +190,10 @@ func (s *Server) servePostcodeAt(w http.ResponseWriter, r *http.Request) {
 	lat, latErr := strconv.ParseFloat(r.URL.Query().Get("lat"), 64)
 	if lonErr != nil || latErr != nil {
 		http.Error(w, "lon and lat query parameters are required", http.StatusBadRequest)
+		return
+	}
+	if math.IsNaN(lon) || math.IsNaN(lat) || math.IsInf(lon, 0) || math.IsInf(lat, 0) || lon < -180 || lon > 180 || lat < -90 || lat > 90 {
+		http.Error(w, "lon must be finite and within [-180,180]; lat within [-90,90]", http.StatusBadRequest)
 		return
 	}
 	point := geo.Point{lon, lat}

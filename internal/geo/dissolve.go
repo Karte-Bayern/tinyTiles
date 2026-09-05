@@ -56,14 +56,14 @@ type directedEdge struct {
 // repeats a directed edge, so a reverse match can only come from a
 // different, adjacent ring's shared border.
 func cancelSharedEdges(rings []Ring) []directedEdge {
-	present := make(map[quantPoint]map[quantPoint]bool)
-	mark := func(a, b quantPoint) {
-		if present[a] == nil {
-			present[a] = make(map[quantPoint]bool)
-		}
-		present[a][b] = true
+	// One flat set avoids a separate map allocation for every vertex.
+	type edgeKey struct{ a, b quantPoint }
+	count := 0
+	for _, r := range rings {
+		count += max(0, len(r)-1)
 	}
-	var edges []directedEdge
+	present := make(map[edgeKey]struct{}, count)
+	edges := make([]directedEdge, 0, count)
 	for _, r := range rings {
 		for i := 0; i+1 < len(r); i++ {
 			a, b := r[i], r[i+1]
@@ -72,12 +72,12 @@ func cancelSharedEdges(rings []Ring) []directedEdge {
 				continue
 			}
 			edges = append(edges, directedEdge{a, b, qa, qb})
-			mark(qa, qb)
+			present[edgeKey{qa, qb}] = struct{}{}
 		}
 	}
 	surviving := edges[:0]
 	for _, e := range edges {
-		if present[e.qb] != nil && present[e.qb][e.qa] {
+		if _, found := present[edgeKey{e.qb, e.qa}]; found {
 			continue // canceled by a matching reverse edge elsewhere
 		}
 		surviving = append(surviving, e)

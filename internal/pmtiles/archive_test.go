@@ -303,3 +303,75 @@ func TestEachTilePropagatesContextCancellation(t *testing.T) {
 		t.Fatal("cancelled traversal returned no error")
 	}
 }
+
+func TestArchiveCancellationInsideRun(t *testing.T) {
+	path := buildArchive(t, pmtilestest.Options{MaxZoom: 2, Tiles: []pmtilestest.Tile{{TileID: 1, RunLength: 10, Data: []byte("tile")}}})
+	a, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	err = a.EachTile(ctx, func(Tile) error { calls++; cancel(); return nil })
+	if err != context.Canceled || calls != 1 {
+		t.Fatalf("calls=%d err=%v", calls, err)
+	}
+}
+
+func TestArchivePreflightRejectsInvalidEntryExtents(t *testing.T) {
+	for _, leaf := range []bool{false, true} {
+		path := buildArchive(t, pmtilestest.Options{UseLeafDirectory: leaf, Tiles: []pmtilestest.Tile{{Data: []byte("tile")}}})
+		a, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if leaf {
+			a.header.LeafDirectoryLength = 0
+		} else {
+			a.header.TileDataLength = 0
+		}
+		if _, err := a.InspectTiles(context.Background()); err == nil {
+			t.Error("preflight accepted invalid section extent")
+		}
+		if err := a.EachTile(context.Background(), func(Tile) error { return nil }); err == nil {
+			t.Error("import accepted invalid section extent")
+		}
+		a.Close()
+	}
+}
+
+func TestArchivePreflightRejectsRunOutsideTileIDSpace(t *testing.T) {
+	path := buildArchive(t, pmtilestest.Options{MaxZoom: 30, Tiles: []pmtilestest.Tile{{TileID: maxTileID, RunLength: 2, Data: []byte("tile")}}})
+	a, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err := a.InspectTiles(context.Background()); err == nil {
+		t.Fatal("preflight accepted overflowing tile IDs")
+	}
+}
+
+func BenchmarkArchiveEachTile(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "bench.pmtiles")
+	entries := make([]pmtilestest.Tile, 1000)
+	for i := range entries {
+		entries[i] = pmtilestest.Tile{TileID: uint64(i), Data: make([]byte, 4096)}
+	}
+	pmtilestest.Build(b, path, pmtilestest.Options{MaxZoom: 6, UseLeafDirectory: true, Tiles: entries})
+	a, err := Open(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer a.Close()
+	b.ReportAllocs()
+	b.SetBytes(1000 * 4096)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := a.EachTile(context.Background(), func(Tile) error { return nil }); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -345,3 +345,31 @@ func createNormalizedMBTilesReuseFixture(path string) error {
 	}
 	return tx.Commit()
 }
+
+type shortTileWriter struct{}
+
+func (shortTileWriter) Write(p []byte) (int, error) { return len(p) - 1, nil }
+
+func TestTileCoordinateSchemesAndShortWrite(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.mbtiles")
+	artifact := filepath.Join(dir, "source.ttiles")
+	if err := createFlatMBTilesFixture(source); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"import", "--min-free", "0", source, artifact}, &stdout, &stderr); code != 0 {
+		t.Fatal(stderr.String())
+	}
+	for _, tc := range []struct{ scheme, y string }{{"tms", "17"}, {"xyz", "238"}} {
+		stdout.Reset()
+		stderr.Reset()
+		if code := commandTile([]string{"-scheme", tc.scheme, artifact, "8", "2", tc.y}, &stdout, &stderr); code != 0 || !bytes.Equal(stdout.Bytes(), []byte{1, 2, 17}) {
+			t.Fatalf("%s: code=%d data=%x err=%s", tc.scheme, code, stdout.Bytes(), stderr.String())
+		}
+	}
+	stderr.Reset()
+	if code := commandTile([]string{artifact, "8", "2", "17"}, shortTileWriter{}, &stderr); code != 1 || !strings.Contains(stderr.String(), "short write") {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+}

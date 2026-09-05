@@ -104,6 +104,12 @@ make build-reader-cli
 ./dist/tinytiles-reader tile region.ttiles/ 8 137 167 > tile.pbf
 ```
 
+`tile` liest standardmäßig TMS-Koordinaten. Für Koordinaten aus einer Webkarte
+kann `tile -scheme xyz region.ttiles/ 8 137 88` verwendet werden; das ist
+dieselbe gespeicherte Kachel wie TMS `8 137 167`. Ungültige Koordinaten,
+Koordinatenschemata und negative Speicherbudgets werden bereits vor dem
+Öffnen des Artefakts abgewiesen.
+
 Die Befehle `validate`, `inspect` und `tile` funktionieren ohne SQLite.
 `build`, `import` und `benchmark` geben dort absichtlich einen eindeutigen
 Build-Tag-Fehler zurück.
@@ -776,7 +782,24 @@ Sidecar, den `tinytiles build --postal-codes` schreibt) kommen zusätzlich
 /postcode/search?q=` (Präfix-/Teilstring-Suche) und `GET
 /postcode/at?lon=&lat=` (Rückwärtssuche — welche Postleitzahl enthält diese
 Koordinate) hinzu; ohne konfigurierten Postleitzahl-Index sind alle drei
-Routen nicht registriert, nicht nur leer. Die MBTiles-Standardmetadaten `format` werden
+Routen nicht registriert, nicht nur leer.
+
+Die Postleitzahl-Suche unterstützt `limit` (1–50, Standard 50) und `offset`
+(nichtnegative Ganzzahl, Standard 0), beispielsweise
+`/postcode/search?q=land&limit=10&offset=10`. Die Antwort bleibt
+`{"results":[...]}`, nach Postleitzahl sortiert; der Offset zählt passende
+Treffer. Eine Seite mit weniger Treffern als dem Limit kennzeichnet das Ende.
+Ungültige Parameter liefern HTTP 400. Die Suche ignoriert Groß-/Kleinschreibung
+und verwendet beim Laden des Index vorbereitete Suchwerte.
+Mehrere Features derselben Postleitzahl (unabhängig von Groß-/Kleinschreibung
+und umgebenden Leerzeichen) werden zu einem MultiPolygon-Datensatz
+zusammengeführt; Aussparungen und alle Teilgebiete bleiben erhalten. Angezeigt
+werden die erste Schreibweise und der erste nichtleere Name; alle Namen der
+Teilgebiete bleiben durchsuchbar. Die Rückwärtssuche verlangt endliche
+WGS84-Koordinaten: Längengrad −180…180 und Breitengrad −90…90; ungültige Werte
+liefern HTTP 400.
+
+Die MBTiles-Standardmetadaten `format` werden
 in die passende HTTP-Repräsentation übersetzt: `pbf`/`mvt` wird als
 `application/vnd.mapbox-vector-tile` unter `.mvt` ausgeliefert, während
 Luftbild- und Rasterquellen mit `png`, `jpg`/`jpeg`, `webp`, `avif`, `gif`,

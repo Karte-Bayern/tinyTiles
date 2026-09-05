@@ -90,6 +90,11 @@ make build-reader-cli
 ./dist/tinytiles-reader tile region.ttiles/ 8 137 167 > tile.pbf
 ```
 
+`tile` reads TMS coordinates by default. For coordinates copied from a web
+map, use `tile -scheme xyz region.ttiles/ 8 137 88`; it addresses the same
+stored tile as TMS `8 137 167`. Invalid coordinates, schemes and negative
+memory budgets are rejected before opening the artifact.
+
 Its `validate`, `inspect` and `tile` commands work without SQLite. `build`,
 `import` and `benchmark` intentionally return a clear build-tag error there.
 
@@ -712,7 +717,23 @@ sidecar `tinytiles build --postal-codes` writes) additionally enables
 `GET /postcode/{code}` (full boundary lookup), `GET /postcode/search?q=`
 (prefix/substring search) and `GET /postcode/at?lon=&lat=` (reverse lookup —
 which postcode contains this coordinate); all three are unregistered, not
-just empty, when no postcode index is configured. The standard MBTiles
+just empty, when no postcode index is configured.
+
+Postcode search accepts `limit` (1–50, default 50) and `offset` (a
+non-negative integer, default 0), for example
+`/postcode/search?q=land&limit=10&offset=10`. The response remains
+`{"results":[...]}`, ordered by postcode; the offset counts matching results.
+A page shorter than the limit means there are no more matches. Invalid
+pagination parameters return HTTP 400. Search is case-insensitive and uses
+code and name values normalized once when the index is loaded.
+Multiple features with the same postcode (ignoring case and surrounding
+whitespace) are combined into one MultiPolygon record, preserving holes and
+all component areas. The first spelling and first non-empty name are used
+for display; every component name remains searchable. Reverse lookup requires
+finite WGS84 coordinates: longitude −180…180 and latitude −90…90; invalid
+values return HTTP 400.
+
+The standard MBTiles
 `format` metadata is translated to
 the matching HTTP representation: `pbf`/`mvt` serves
 `application/vnd.mapbox-vector-tile` at `.mvt`, while aerial and raster sources
